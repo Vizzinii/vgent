@@ -5,6 +5,7 @@ description = "通用 agent CLI（参考主流实现，各取所长）"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "mcp<2",
     "openai>=1.40",
     "prompt-toolkit>=3.0",
     "rich>=13.7",

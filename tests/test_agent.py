@@ -7,6 +7,7 @@ from vgent.agent import SessionContext, run_turn
 from vgent.config import ContextConfig
 from vgent.context import ContextEngine
 from vgent.llm import ChatResult
+from vgent.memory.episodic import EpisodicMemory
 from vgent.messages import Message, ToolCall, Usage
 from vgent.permission import ConfirmResult, PermissionSystem
 from vgent.state import AgentState
@@ -124,6 +125,7 @@ def test_tool_rejected_by_permission(tmp_path) -> None:
     llm = ScriptedLLM(
         [
             _chat_with_tools(ToolCall("c1", "rm", '{"path": "/x"}')),
+            _chat_final("Failure: 用户拒绝执行\nAction: 放弃删除"),  # M7：拒绝触发反思的响应
             _chat_final("已取消"),
         ]
     )
@@ -133,6 +135,10 @@ def test_tool_rejected_by_permission(tmp_path) -> None:
     assert executed is False
     tool_msg = next(m for m in store.get_history(sid) if m.role == "tool")
     assert "拒绝" in tool_msg.content
+    _reflected = [
+        m[0] for m in llm.calls if m and m[0].role == "system" and m[0].content.startswith("[反思]")
+    ]
+    assert _reflected  # M7：失败 → 反思注入后续发送列表下一轮
     store.close()
 
 
@@ -143,6 +149,7 @@ def test_unknown_tool_fed_back(tmp_path) -> None:
     llm = ScriptedLLM(
         [
             _chat_with_tools(ToolCall("c1", "no_such_tool", "{}")),
+            _chat_final("Failure: 工具名拼错\nAction: 使用已提供工具"),  # M7：反思响应
             _chat_final("完成"),
         ]
     )
@@ -151,6 +158,10 @@ def test_unknown_tool_fed_back(tmp_path) -> None:
     run_turn("x", ctx)
     tool_msg = next(m for m in store.get_history(sid) if m.role == "tool")
     assert "未知工具" in tool_msg.content
+    _reflected = [
+        m[0] for m in llm.calls if m and m[0].role == "system" and m[0].content.startswith("[反思]")
+    ]
+    assert _reflected  # M7：失败 → 反思注入后续发送列表
     store.close()
 
 
@@ -170,6 +181,7 @@ def test_malformed_args_not_executed(tmp_path) -> None:
     llm = ScriptedLLM(
         [
             _chat_with_tools(ToolCall("c1", "add", "{bad json")),
+            _chat_final("Failure: 参数非法\nAction: 修正参数格式"),  # M7：反思响应
             _chat_final("修正后完成"),
         ]
     )
@@ -179,6 +191,10 @@ def test_malformed_args_not_executed(tmp_path) -> None:
     assert executed is False
     tool_msg = next(m for m in store.get_history(sid) if m.role == "tool")
     assert "参数解析失败" in tool_msg.content
+    _reflected = [
+        m[0] for m in llm.calls if m and m[0].role == "system" and m[0].content.startswith("[反思]")
+    ]
+    assert _reflected  # M7：失败 → 反思注入后续发送列表
     store.close()
 
 
@@ -493,4 +509,222 @@ def test_state_completed_and_failed(tmp_path) -> None:
         run_turn("炸了", ctx2)
     assert ctx2.state is AgentState.FAILED
     assert store.get_state(sid) == "failed"
+    store.close()
+
+
+# -- M7：反思循环 ---------------------------------------------------------------
+
+
+def test_reflection_triggered_and_recovers(tmp_path) -> None:
+    """工具失败 → 反思（Failure/Action 注入下一轮）→ 模型修正重试成功。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    reg = ToolRegistry()
+    calls: list[str] = []
+
+    def flaky(args: dict) -> str:
+        calls.append(args.get("cmd", ""))
+        return "exit 1\ncommand not found: badcmd" if len(calls) == 1 else "exit 0\nok"
+
+    reg.register(ToolSchema("run", "运行", {"type": "object"}, "read"), flaky)
+    llm = ScriptedLLM(
+        [
+            _chat_with_tools(ToolCall("c1", "run", '{"cmd": "badcmd"}')),
+            _chat_final("Failure: 命令不存在\nAction: 改用 echo"),
+            _chat_with_tools(ToolCall("c2", "run", '{"cmd": "echo hi"}')),
+            _chat_final("修正后执行成功"),
+        ]
+    )
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, tools=reg)
+
+    result = run_turn("执行并修正", ctx)
+    assert calls == ["badcmd", "echo hi"]  # 反思后重试了修正命令
+    assert result.messages[0].content == "修正后执行成功"
+    reflected = [
+        m[0] for m in llm.calls if m and m[0].role == "system" and m[0].content.startswith("[反思]")
+    ]
+    assert reflected and "Failure" in reflected[0].content
+    store.close()
+
+
+def test_no_reflection_on_success(tmp_path) -> None:
+    """工具全部成功：不触发反思（不额外消耗 LLM 调用）。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    reg = ToolRegistry()
+    reg.register(ToolSchema("run", "运行", {"type": "object"}, "read"), lambda a: "exit 0\nok")
+    llm = ScriptedLLM(
+        [
+            _chat_with_tools(ToolCall("c1", "run", "{}")),
+            _chat_final("完成"),
+        ]
+    )
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, tools=reg)
+
+    run_turn("跑", ctx)
+    assert len(llm.calls) == 2  # 工具轮 + 收尾轮；无反思轮
+    assert not any(m[0].content.startswith("[反思]") for m in llm.calls)
+    store.close()
+
+
+def test_reflection_rounds_cap(tmp_path, monkeypatch) -> None:
+    """连续失败：反思次数封顶（monkeypatch 上限为 1），不无限反思烧 token。"""
+    monkeypatch.setattr("vgent.agent.MAX_REFLECT_ROUNDS", 1)
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    reg = ToolRegistry()
+    reg.register(ToolSchema("run", "运行", {"type": "object"}, "read"), lambda a: "exit 1\nboom")
+    llm = ScriptedLLM(
+        [
+            _chat_with_tools(ToolCall("c1", "run", "{}")),
+            _chat_final("Failure: 持续失败\nAction: 重试"),
+            _chat_with_tools(ToolCall("c2", "run", "{}")),
+            _chat_with_tools(ToolCall("c3", "run", "{}")),
+            _chat_final("仍然失败，放弃"),
+        ]
+    )
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, tools=reg)
+
+    run_turn("跑", ctx)
+    reflect_sends = [
+        m for m in llm.calls if m and m[0].role == "system" and m[0].content.startswith("[反思]")
+    ]
+    assert len(reflect_sends) == 1  # 只反思一次，之后不再注入
+    store.close()
+
+
+# -- M8：episodic 记忆（自动回忆注入 / 任务完成自动摘要） ------------------------
+
+
+def test_auto_recall_injects_memory_on_keyword(tmp_path) -> None:
+    """M8：用户消息命中已存主题 → 首个 LLM 调用注入 [记忆]（不落库）。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    mem.add("git 仓库优化", "扫描发现 1 个瓶颈，结论：升级依赖", "other_sid", "优化 git")
+    llm = ScriptedLLM([_chat_final("好的，根据记忆处理")])
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, memory=mem)
+    run_turn("继续上次那个 git 仓库优化", ctx)
+    sent = llm.calls[0]
+    assert any(
+        m.role == "system" and m.content.startswith("[记忆]") and "git" in m.content
+        for m in sent
+    )
+    # 自动注入不落库：历史只有 user + assistant
+    assert [m.role for m in store.get_history(sid)] == ["user", "assistant"]
+    store.close()
+
+
+def test_auto_recall_no_match_no_inject(tmp_path) -> None:
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    mem.add("git 仓库优化", "摘要", "other_sid", "优化 git")
+    llm = ScriptedLLM([_chat_final("完成")])
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, memory=mem)
+    run_turn("帮我写段代码", ctx)
+    assert not any(m.role == "system" and "[记忆]" in m.content for m in llm.calls[0])
+    store.close()
+
+
+def test_auto_recall_skips_when_already_in_history(tmp_path) -> None:
+    """M8：历史里已有同主题 [记忆]（/recall 落库过）→ 不再重复注入。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    mem.add("git 仓库优化", "摘要", "other_sid", "优化 git")
+    store.add_message(sid, Message("system", "[记忆] git 仓库优化（2026-08-21）：摘要"))
+    llm = ScriptedLLM([_chat_final("ok")])
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, memory=mem)
+    run_turn("继续 git 仓库优化", ctx)
+    injected = [
+        m for m in llm.calls[0]
+        if m.role == "system" and m.content.startswith("[记忆]")
+    ]
+    assert len(injected) == 1  # 只有历史里那份
+    store.close()
+
+
+def test_memory_none_noop(tmp_path) -> None:
+    """M8：未配置 memory 对象 → 不注入、不报错（旧行为保持）。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    llm = ScriptedLLM([_chat_final("完成")])
+    ctx = SessionContext(session_id=sid, store=store, llm=llm)
+    run_turn("继续上次那个 git 项目", ctx)
+    assert not any(m.role == "system" and "[记忆]" in m.content for m in llm.calls[0])
+    store.close()
+
+
+def test_auto_memory_on_plan_done(tmp_path) -> None:
+    """M8：memory_auto + 计划全 done → 回合结束自动存摘要；每会话只存一次。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session(title="分析项目")
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    reg = ToolRegistry()
+    reg.register(ToolSchema("probe", "探测", {"type": "object"}, "read"), lambda a: "ok")
+    done_block = _plan_block('{"steps": [{"description": "扫描", "status": "done"}]}')
+    llm = ScriptedLLM(
+        [
+            _chat_with_tools(ToolCall("c1", "probe", "{}"), content=done_block),
+            _chat_final(done_block),  # 带 done 计划块 → 不再收尾标齐
+            _chat_final("做了扫描，得出结论是 OK，没有遗留事项"),  # auto-summary 的摘要响应
+        ]
+    )
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, tools=reg, memory=mem, memory_auto=True)
+    run_turn("分析", ctx)
+    assert mem.count() == 1
+    assert mem.search("分析")[0].summary == "做了扫描，得出结论是 OK，没有遗留事项"  # topic=title
+    # 第二次 run_turn：has_session 去重 → 不再调用 summarize
+    llm2 = ScriptedLLM(
+        [
+            _chat_final("x"),  # 无工具调用；计划已 done 但未带新块 → 收尾标齐
+            _chat_final(done_block),
+        ]
+    )
+    ctx2 = SessionContext(session_id=sid, store=store, llm=llm2, memory=mem, memory_auto=True)
+    run_turn("再来", ctx2)
+    assert mem.count() == 1
+    assert len(llm2.calls) == 2  # 没有第三次 summarize 调用
+    store.close()
+
+
+# -- M10：项目指令（AGENTS.md）注入 -------------------------------------------------
+
+
+def test_instructions_injected_first_call_only(tmp_path) -> None:
+    """M10：首轮注入项目指令（首个 LLM 调用），不落库；第二轮不再注入。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    llm = ScriptedLLM([_chat_final("收到"), _chat_final("继续")])
+    ctx = SessionContext(
+        session_id=sid,
+        store=store,
+        llm=llm,
+        instructions="不要删除任何文件",
+        instructions_name="AGENTS.md",
+    )
+    run_turn("任务一", ctx)
+    assert any(
+        m.role == "system" and m.content.startswith("项目指令（AGENTS.md）")
+        for m in llm.calls[0]
+    )
+    # 不落库：历史只有 user + assistant
+    assert [m.role for m in store.get_history(sid)] == ["user", "assistant"]
+    # 第二轮：不再注入
+    run_turn("任务二", ctx)
+    assert not any(
+        m.role == "system" and "项目指令" in m.content for m in llm.calls[1]
+    )
+    store.close()
+
+
+def test_no_instructions_no_inject(tmp_path) -> None:
+    """M10：未配置 instructions → 不注入、不报错。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    llm = ScriptedLLM([_chat_final("完成")])
+    ctx = SessionContext(session_id=sid, store=store, llm=llm)
+    run_turn("任务", ctx)
+    assert not any(m.role == "system" and "项目指令" in m.content for m in llm.calls[0])
     store.close()

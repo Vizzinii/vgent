@@ -15,8 +15,10 @@ from dataclasses import dataclass, field
 
 from vgent.context import ContextEngine
 from vgent.llm import ChatResult, LLMClient
+from vgent.memory.episodic import EpisodicMemory, summarize
 from vgent.messages import Message, ToolCall
 from vgent.permission import Approval, ConfirmResult, PermissionSystem
+from vgent.reflection import MAX_REFLECT_ROUNDS, looks_failed, reflect
 from vgent.state import AgentState
 from vgent.store import SessionStore
 from vgent.task import PLAN_HINT, TaskPlan, plan_from_messages
@@ -44,6 +46,12 @@ class SessionContext:
     show_reasoning: bool = False  # M5：是否流式展示模型思考过程（/reasoning 切换）
     plan: TaskPlan | None = None  # M6：当前任务计划（恢复自历史/每轮更新）
     state: AgentState = AgentState.IDLE  # M6：当前状态（每轮结束落库）
+    memory: EpisodicMemory | None = None  # M8：episodic 记忆（跨会话任务摘要）
+    memory_auto: bool = False  # M8：任务计划完成时自动存摘要（每会话一次）
+    mcp_tools: dict[str, list[str]] = field(default_factory=dict)  # M9：已加载的 MCP 工具 {server: [names]}
+    instructions: str | None = None  # M10：项目指令内容（AGENTS.md/CLAUDE.md）
+    instructions_name: str | None = None  # M10：指令来源文件名（cli 解析时记录）
+    ext_commands: dict[str, Callable] = field(default_factory=dict)  # M10：外部命令 {name: run(ctx, args)}
 
 
 def run_turn(
@@ -76,10 +84,33 @@ def run_turn(
     ctx.state = AgentState.EXECUTING if ctx.plan else AgentState.PLANNING
     hint: Message | None = None if ctx.plan else Message("system", PLAN_HINT)
     plan_nudge: Message | None = None  # 工具执行后轻推模型同步计划状态
+    # M7：失败反思——本轮失败计数与待注入的反思消息（上限内失败才反思）
+    reflections = 0
+    reflection_note: Message | None = None
     # 工作目录锚点：新会话首轮注入一次，防止模型在错误 CWD 下瞎找（真机首跑踩坑）
     cwd_anchor: Message | None = (
         Message("system", f"工作目录：{os.getcwd()}；工具的相对路径基于此。") if first_turn else None
     )
+    # M10：项目指令（AGENTS.md/CLAUDE.md）——新会话首轮注入一次，不落库（与 cwd_anchor 同模式）
+    instructions_anchor: Message | None = (
+        Message(
+            "system",
+            f"项目指令（{ctx.instructions_name or 'AGENTS.md'}）：\n{ctx.instructions}",
+        )
+        if first_turn and ctx.instructions
+        else None
+    )
+    # M8：自动回忆——用户消息命中已存记忆主题 → 注入 [记忆]（不落库，一次性）
+    memory_notes: list[Message] | None = None
+    if ctx.memory is not None:
+        hits = [
+            e for e in ctx.memory.search(user_input, limit=2)
+            if not _memory_already_present(msgs, e.topic)
+        ]
+        if hits:
+            memory_notes = [
+                Message("system", f"[记忆] {e.topic}（{e.ts[:10]}）：{e.summary}") for e in hits
+            ]
 
     try:
         for _ in range(MAX_TOOL_ROUNDS):
@@ -91,10 +122,19 @@ def run_turn(
             if cwd_anchor is not None:  # 工作目录锚点：只注入首个 LLM 调用
                 send.insert(0, cwd_anchor)
                 cwd_anchor = None
+            if instructions_anchor is not None:  # M10：项目指令：只注入首个 LLM 调用
+                send.insert(0, instructions_anchor)
+                instructions_anchor = None
             if hint is not None:  # M6：无计划时注入规划提示（不落库）
                 send.insert(0, hint)
             if plan_nudge is not None:  # M6：有工具执行 → 轻推同步计划状态
                 send.insert(0, plan_nudge)
+            if reflection_note is not None:  # M7：上轮失败 → 注入反思修正动作
+                send.insert(0, reflection_note)
+                reflection_note = None
+            if memory_notes is not None:  # M8：历史记忆一次性注入（不落库）
+                send = memory_notes + send
+                memory_notes = None
             # 传快照：LLM 客户端（或测试桩）可能持有该列表，后续 extend 不应污染它
             result = ctx.llm.chat(
                 send, tools=ctx.tools.schemas(), on_delta=on_delta, on_reasoning=on_reasoning
@@ -115,11 +155,22 @@ def run_turn(
                     _finalize_plan(ctx, msgs)
                 ctx.state = AgentState.COMPLETED
                 _persist_state(ctx)
+                _maybe_auto_memory(ctx, msgs)  # M8：计划完成 → 自动存摘要（可配置）
                 return result
+            failed_any = False
             for tc in result.tool_calls:
                 tool_msg = _dispatch_tool(tc, ctx, on_tool)
                 ctx.store.add_message(ctx.session_id, tool_msg)
                 msgs.append(tool_msg)
+                if looks_failed(tool_msg.content):
+                    failed_any = True
+            # M7：失败 → 显式反思一次（上限内），结果注入下一轮发送列表（不落库，
+            # 一次性引导；模型不配合/反思失败自动回退决策 9 的错误回喂）
+            if failed_any and reflections < MAX_REFLECT_ROUNDS:
+                reflections += 1
+                note = reflect(msgs, ctx.llm)
+                if note:
+                    reflection_note = Message("system", f"[反思] {note}")
             if ctx.plan is not None:
                 plan_nudge = Message(
                     "system",
@@ -165,6 +216,30 @@ def _finalize_plan(ctx: SessionContext, msgs: list[Message]) -> None:
 def _persist_state(ctx: SessionContext) -> None:
     """M6：把当前 Agent 状态落库（供恢复/展示）。"""
     ctx.store.set_state(ctx.session_id, ctx.state.value)
+
+
+def _memory_already_present(msgs: list[Message], topic: str) -> bool:
+    """历史里是否已有该主题的 [记忆]（防自动回忆重复注入）。"""
+    return any(
+        m.role == "system" and m.content.startswith("[记忆]") and topic in m.content
+        for m in msgs
+    )
+
+
+def _maybe_auto_memory(ctx: SessionContext, msgs: list[Message]) -> None:
+    """M8：memory_auto + 任务计划完成 → 自动生成并存储会话摘要（每会话一次）。"""
+    if not (ctx.memory and ctx.memory_auto):
+        return
+    if ctx.plan is None or not ctx.plan.done:
+        return
+    if ctx.memory.has_session(ctx.session_id):
+        return
+    title = ctx.store.get_title(ctx.session_id) or (
+        ctx.plan.steps[0].description if ctx.plan.steps else "会话"
+    )
+    summary = summarize(msgs, ctx.llm, title)
+    if summary:
+        ctx.memory.add(title, summary, ctx.session_id, title)
 
 
 def _dispatch_tool(

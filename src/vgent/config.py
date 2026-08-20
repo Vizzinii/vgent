@@ -47,12 +47,28 @@ class ContextConfig:
 
 
 @dataclass
+class MCPServerConfig:
+    """M9：一个 MCP 服务器（stdio 启动命令 + 工具默认权限档位）。"""
+
+    command: str
+    args: list[str] = field(default_factory=list)
+    cwd: str | None = None  # 服务器进程工作目录（可选）
+    permission: str = "exec"  # 该 server 工具默认权限档位（外部能力，保守需确认）
+
+    @property
+    def display(self) -> str:
+        return " ".join([self.command, *self.args])
+
+
+@dataclass
 class Config:
     data_dir: Path = DEFAULT_DATA_DIR
     log_level: str = "INFO"
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     show_reasoning: bool = False  # M5：流式展示模型思考过程（/reasoning 可随时切换）
+    memory_auto: bool = False  # M8：任务计划完成时自动生成会话摘要并存储（每会话一次）
+    mcp_servers: dict[str, MCPServerConfig] = field(default_factory=dict)  # M9：MCP 服务器
 
     def api_key_resolved(self) -> str:
         return self.provider.api_key_resolved()
@@ -76,9 +92,27 @@ def load_config(path: Path | None = None, provider: str | None = None) -> Config
         cfg.log_level = data["log_level"]
     if "show_reasoning" in data:
         cfg.show_reasoning = bool(data["show_reasoning"])
+    if "memory_auto" in data:
+        cfg.memory_auto = bool(data["memory_auto"])
     if "context" in data:
         for key, value in data["context"].items():
             setattr(cfg.context, key, value)
+    # M9：MCP 服务器（[mcp.servers.<name>] command/args/cwd/permission）
+    if "mcp" in data and isinstance(data["mcp"], dict):
+        servers = data["mcp"].get("servers", {})
+        if isinstance(servers, dict):
+            for name, section in servers.items():
+                if not isinstance(section, dict) or not section.get("command"):
+                    continue
+                permission = str(section.get("permission", "exec"))
+                if permission not in ("read", "write", "exec"):
+                    permission = "exec"
+                cfg.mcp_servers[name] = MCPServerConfig(
+                    command=str(section["command"]),
+                    args=[str(a) for a in section.get("args", [])],
+                    cwd=str(section["cwd"]) if section.get("cwd") else None,
+                    permission=permission,
+                )
 
     providers = _resolve_providers(data)
     if providers:

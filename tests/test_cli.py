@@ -120,3 +120,229 @@ def test_compact_inline_sets_compacted(tmp_path) -> None:
     _compact_inline(ctx2, Console())
     assert ctx2.engine.compacted is None
     store.close()
+
+
+def test_reflect_inline_short_session(tmp_path) -> None:
+    """M7：空会话 /reflect 提示无需反思，不崩溃。"""
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _reflect_inline
+
+    store = _store(tmp_path)
+    sid = store.create_session()
+    ctx = SessionContext(session_id=sid, store=store, llm=SimpleNamespace(chat=lambda *a, **k: None))
+    _reflect_inline(ctx, Console())
+    store.close()
+
+
+def test_reflect_inline_no_llm_output_not_persisted(tmp_path) -> None:
+    """M7：有历史但 LLM 无响应：提示未产出内容，不落库不崩溃。"""
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _reflect_inline
+    from vgent.messages import Message
+
+    store = _store(tmp_path)
+    sid = store.create_session()
+    store.add_message(sid, Message("user", "任务"))
+    store.add_message(sid, Message("tool", "exit 1\nboom", tool_call_id="c1"))
+    ctx = SessionContext(
+        session_id=sid, store=store, llm=SimpleNamespace(chat=lambda *a, **k: None)
+    )
+    _reflect_inline(ctx, Console())
+    assert len(store.get_history(sid)) == 2  # 反思未产出 → 不落库
+    store.close()
+
+
+# -- M8：记忆命令处理器 ---------------------------------------------------------
+
+
+def test_remember_inline_stores_summary(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _remember_inline
+    from vgent.memory.episodic import EpisodicMemory
+    from vgent.messages import Message
+
+    store = _store(tmp_path)
+    sid = store.create_session(title="重构任务")
+    store.add_message(sid, Message("user", "帮我重构"))
+    store.add_message(sid, Message("assistant", "完成"))
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+
+    class FakeLLM:
+        def chat(self, messages, tools=None, on_delta=None, on_reasoning=None):
+            return SimpleNamespace(
+                messages=[Message("assistant", "做了重构，得出结论：OK，遗留事项是补测试")]
+            )
+
+    ctx = SessionContext(session_id=sid, store=store, llm=FakeLLM(), memory=mem)
+    _remember_inline(ctx, Console(), "重构")
+    assert mem.count() == 1
+    assert mem.search("重构")[0].summary == "做了重构，得出结论：OK，遗留事项是补测试"
+
+
+def test_remember_inline_short_session(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _remember_inline
+    from vgent.memory.episodic import EpisodicMemory
+
+    store = _store(tmp_path)
+    sid = store.create_session()
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    ctx = SessionContext(
+        session_id=sid, store=store, llm=SimpleNamespace(chat=lambda *a, **k: None), memory=mem
+    )
+    _remember_inline(ctx, Console(), "主题")
+    assert mem.count() == 0  # 太短不存
+    store.close()
+
+
+def test_recall_inline_injects_and_persists(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _recall_inline
+    from vgent.memory.episodic import EpisodicMemory
+
+    store = _store(tmp_path)
+    sid = store.create_session()
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    mem.add("git 仓库优化", "扫描发现 1 个瓶颈", "other_sid", "优化 git")
+    ctx = SessionContext(
+        session_id=sid, store=store, llm=SimpleNamespace(chat=lambda *a, **k: None), memory=mem
+    )
+    _recall_inline(ctx, Console(), "git")
+    hist = store.get_history(sid)
+    assert any(m.role == "system" and m.content.startswith("[记忆]") for m in hist)
+    store.close()
+
+
+def test_recall_inline_no_match(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _recall_inline
+    from vgent.memory.episodic import EpisodicMemory
+
+    store = _store(tmp_path)
+    sid = store.create_session()
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    mem.add("git 仓库优化", "摘要", "other_sid", "优化 git")
+    ctx = SessionContext(
+        session_id=sid, store=store, llm=SimpleNamespace(chat=lambda *a, **k: None), memory=mem
+    )
+    _recall_inline(ctx, Console(), "zzz")
+    assert all("[记忆]" not in m.content for m in store.get_history(sid))
+    store.close()
+
+
+def test_memories_inline_empty_and_list(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _memories_inline
+    from vgent.memory.episodic import EpisodicMemory
+
+    store = _store(tmp_path)
+    sid = store.create_session()
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    mem.add("重构", "做了重构", "other_sid", "重构任务")
+    ctx = SessionContext(
+        session_id=sid, store=store, llm=SimpleNamespace(chat=lambda *a, **k: None), memory=mem
+    )
+    _memories_inline(ctx, Console())  # 有记忆：打印不崩溃
+    ctx2 = SessionContext(
+        session_id=sid, store=store, llm=SimpleNamespace(chat=lambda *a, **k: None),
+        memory=EpisodicMemory(tmp_path / "empty.jsonl"),
+    )
+    _memories_inline(ctx2, Console())  # 空记忆：提示不崩溃
+    store.close()
+
+
+# -- M10：外部命令分发 ------------------------------------------------------------
+
+
+def test_dispatch_external_command(tmp_path) -> None:
+    """M10：外部命令命中 → run(ctx, args) 执行并返回 True；普通文本返回 False。"""
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _dispatch_command
+
+    store = _store(tmp_path)
+    sid = store.create_session()
+    seen: list[tuple[str, str]] = []
+
+    def mycmd(ctx, args: str) -> str:
+        seen.append((args, "called"))
+        return "外部命令输出"
+
+    ctx = SessionContext(
+        session_id=sid,
+        store=store,
+        llm=SimpleNamespace(chat=lambda *a, **k: None),
+        ext_commands={"mycmd": mycmd},
+    )
+    assert _dispatch_command("/mycmd hello", ctx, Console(), lambda p: "", tmp_path / "last", {"n": 0}) is True
+    assert seen == [("hello", "called")]
+    # 普通文本（非 /）交给 LLM
+    assert _dispatch_command("帮我写代码", ctx, Console(), lambda p: "", tmp_path / "last", {"n": 0}) is False
+    # 未注册的外部命令名 → 交给 LLM
+    assert _dispatch_command("/nosuch", ctx, Console(), lambda p: "", tmp_path / "last", {"n": 0}) is False
+    store.close()
+
+
+def test_dispatch_builtin_priority_over_external(tmp_path) -> None:
+    """M10：外部命令与内置重名 → 内置优先（外部不执行）。"""
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _dispatch_command
+
+    store = _store(tmp_path)
+    sid = store.create_session()
+    called = False
+
+    def evil(ctx, args: str) -> str:
+        nonlocal called
+        called = True
+        return "不应执行"
+
+    ctx = SessionContext(
+        session_id=sid,
+        store=store,
+        llm=SimpleNamespace(chat=lambda *a, **k: None),
+        ext_commands={"list": evil},
+    )
+    assert _dispatch_command("/list", ctx, Console(), lambda p: "", tmp_path / "last", {"n": 0}) is True
+    assert called is False  # 内置 /list 优先，外部未执行
+    store.close()
+
+
+def test_dispatch_external_error_not_crash(tmp_path) -> None:
+    """M10：外部命令抛异常 → 捕获提示，不崩溃。"""
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _dispatch_command
+
+    store = _store(tmp_path)
+    sid = store.create_session()
+
+    def boom(ctx, args: str) -> str:
+        raise RuntimeError("坏了")
+
+    ctx = SessionContext(
+        session_id=sid,
+        store=store,
+        llm=SimpleNamespace(chat=lambda *a, **k: None),
+        ext_commands={"boom": boom},
+    )
+    assert _dispatch_command("/boom", ctx, Console(), lambda p: "", tmp_path / "last", {"n": 0}) is True
+    store.close()

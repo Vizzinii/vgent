@@ -4,30 +4,38 @@ M2：最小闭环 + 工具/权限确认交互。
 M4（2026-08-20）：/compact（Summarize LLM 摘要）+ 状态栏（token 用量）+ 会话 title 自动生成；
 zcode 化前置：--provider/--new/--resume/--list-sessions/--delete-session/--version
 flag 族 + /list /delete 命令 + 记住上次会话（~/.vgent/last_session）。
+M10：AGENTS.md 项目指令注入 + 外部命令扩展（~/.vgent/commands）+ REPL 补全/常驻状态栏。
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.history import InMemoryHistory
 from rich.console import Console
 from rich.markup import escape
 
 from vgent import __version__
 from vgent.agent import SessionContext, run_turn
+from vgent.commands import load_commands
 from vgent.config import Config, load_config
 from vgent.context import ContextEngine
 from vgent.llm import LLMClient
+from vgent.mcp import load_into_registry
+from vgent.memory.episodic import EpisodicMemory, summarize
 from vgent.messages import Message
 from vgent.permission import ConfirmResult, PermissionSystem
+from vgent.reflection import reflect
 from vgent.store import SessionStore
 from vgent.task import plan_from_messages
 from vgent.tools import ToolSchema, default_tools
+from vgent.workspace import find_instructions
 
 HELP = """命令：
   /new            新建会话
@@ -36,10 +44,36 @@ HELP = """命令：
   /delete         删除会话（按编号，当前会话不可删）
   /compact        压缩当前会话（LLM 摘要中间历史，下次对话生效）
   /plan           查看任务计划（/plan new 清除并重新规划）
+  /reflect        反思最近失败，生成修正动作（LLM 分析，写入会话）
+  /remember <主题> 记住当前会话（LLM 摘要存本机，供跨会话回忆）
+  /recall <关键词> 检索历史记忆并注入上下文（写入会话）
+  /memories       列出已记住的任务摘要
+  /mcp            列出已加载的 MCP 工具
   /reasoning      切换思考过程展示（开/关，默认关）
   /help           显示帮助
   /exit           退出
+外部命令：~/.vgent/commands/<name>.py 定义 run(ctx, args)，用 /<name> 调用（/help 列出）
 """
+
+_BUILTIN_COMMANDS = (
+    "/new",
+    "/resume",
+    "/list",
+    "/list-sessions",
+    "/delete",
+    "/delete-session",
+    "/compact",
+    "/plan",
+    "/reflect",
+    "/remember",
+    "/recall",
+    "/memories",
+    "/mcp",
+    "/reasoning",
+    "/help",
+    "/exit",
+    "/quit",
+)
 
 
 def setup_logging(level: str) -> None:
@@ -53,20 +87,65 @@ def setup_logging(level: str) -> None:
     # （openai SDK 3.x 的日志器名是 httpx2，不是 httpx）
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpx2").setLevel(logging.WARNING)
+    # M9：mcp SDK 的传输日志同样压掉
+    logging.getLogger("mcp").setLevel(logging.WARNING)
 
 
-def _make_prompter() -> Callable[[str], str]:
+def _make_prompter(completions: list[str] | None = None) -> Callable[[str], str]:
     """返回 prompt(ps) -> str。
 
     优先 prompt_toolkit（真终端下有多行编辑/历史/补全）；在 Git Bash/mintty、管道输入等
     拿不到 Windows 控制台的场景自动退回 input()（Windows 已知坑：NoConsoleScreenBufferError，
     mintty 下 TERM=xterm-256color 会让 Win32Output 构造失败）。
+    M10：可带命令名列表 → WordCompleter（输入 / 时补全内置 + 外部命令）。
     """
     try:
-        session = PromptSession(history=InMemoryHistory())
+        kw: dict = {"history": InMemoryHistory()}
+        if completions:
+            kw["completer"] = WordCompleter(completions, ignore_case=True)
+        session = PromptSession(**kw)
         return session.prompt
     except Exception:  # noqa: BLE001 — 构造失败即退回基础输入，任何环境都能跑
         return lambda ps: input(ps)
+
+
+def _make_repl_prompter(
+    completions: list[str], toolbar: Callable[[], str] | None
+) -> Callable[[str], str]:
+    """REPL 专用 prompter：命令补全 + 常驻底部状态栏（M10）。
+
+    bottom_toolbar 每次渲染输入行时读取当前状态（state/计划/token 由闭包捕获）；
+    input() 回退路径没有补全与工具栏，但不影响功能。
+    """
+    try:
+        kw: dict = {"history": InMemoryHistory()}
+        if completions:
+            kw["completer"] = WordCompleter(completions, ignore_case=True)
+        session = PromptSession(**kw)
+
+        def prompt(ps: str) -> str:
+            if toolbar is not None:
+                return session.prompt(ps, bottom_toolbar=toolbar)
+            return session.prompt(ps)
+
+        return prompt
+    except Exception:  # noqa: BLE001 — 构造失败即退回基础输入
+        return lambda ps: input(ps)
+
+
+def _toolbar_renderer(ctx: SessionContext, tokens: dict) -> Callable[[], str]:
+    """常驻底部状态栏：provider/model、Agent 状态、计划进度、会话累计 token。"""
+
+    def render() -> str:
+        parts = [f"[{ctx.llm.cfg.provider.name}] {ctx.llm.cfg.provider.model}"]
+        parts.append(f"状态 {ctx.state.value}")
+        if ctx.plan and ctx.plan.steps:
+            done = sum(1 for s in ctx.plan.steps if s.status == "done")
+            parts.append(f"计划 {done}/{len(ctx.plan.steps)}")
+        parts.append(f"累计 {tokens['n']} tok")
+        return "vgent | " + " | ".join(parts)
+
+    return render
 
 
 def _print_sessions(
@@ -252,7 +331,11 @@ def _resolve_start_session(
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    cfg = load_config(provider=args.provider)
+    try:
+        cfg = load_config(provider=args.provider)
+    except ValueError as exc:  # 配置错误（如 --provider 无效）友好报错，不抛 traceback
+        Console().print(f"[red]配置错误：{exc}[/red]")
+        return 1
     setup_logging(cfg.log_level)
     console = Console()
 
@@ -278,9 +361,18 @@ def main(argv: list[str] | None = None) -> int:
         _remember_session(last_path, session_id)
         llm = LLMClient(cfg)
         tools = default_tools()
+        mcp_loaded = load_into_registry(tools, cfg.mcp_servers)  # M9：加载 MCP 工具
+        if cfg.mcp_servers:
+            for server, names in mcp_loaded.items():
+                if names:
+                    console.print(f"[dim]MCP: {server}（{len(names)} 工具）[/dim]")
+                else:
+                    console.print(f"[yellow]MCP: {server} 加载失败（已跳过）[/yellow]")
         permissions = PermissionSystem(confirm=_make_confirm(console, prompt))
         engine = ContextEngine(cfg.provider.context_length, cfg.context)
         engine.summarizer = _make_summarizer(llm)  # M4：/compact 的 LLM 摘要器
+        ext_commands = load_commands(cfg.data_dir / "commands")  # M10：外部命令
+        found = find_instructions(os.getcwd())  # M10：项目指令（AGENTS.md/CLAUDE.md）
         ctx = SessionContext(
             session_id=session_id,
             store=store,
@@ -289,8 +381,22 @@ def main(argv: list[str] | None = None) -> int:
             permissions=permissions,
             engine=engine,
             show_reasoning=cfg.show_reasoning,
+            memory=EpisodicMemory(cfg.data_dir / "memory" / "episodic.jsonl"),  # M8
+            memory_auto=cfg.memory_auto,  # M8
+            mcp_tools=mcp_loaded,  # M9
+            instructions=found[1] if found else None,  # M10
+            instructions_name=found[0] if found else None,  # M10
+            ext_commands=ext_commands,  # M10
         )
-        _repl(ctx, console, prompt, last_path)
+        if ext_commands:
+            console.print(f"[dim]外部命令：{', '.join(sorted(ext_commands))}[/dim]")
+        if found:
+            console.print(f"[dim]已加载项目指令 {found[0]}（{len(found[1])} 字符）[/dim]")
+        # M10：REPL prompter = 内置 + 外部命令补全 + 常驻状态栏
+        tokens = {"n": 0}
+        completions = list(_BUILTIN_COMMANDS) + [f"/{n}" for n in ext_commands]
+        repl_prompt = _make_repl_prompter(completions, _toolbar_renderer(ctx, tokens))
+        _repl(ctx, console, repl_prompt, last_path, tokens)
     finally:
         store.close()
     return 0
@@ -306,14 +412,87 @@ def _on_tool(console: Console) -> Callable[[str, str], None]:
     return show
 
 
+def _dispatch_command(
+    text: str,
+    ctx: SessionContext,
+    console: Console,
+    prompt: Callable[[str], str],
+    last_path: Path,
+    tokens: dict,
+) -> bool:
+    """REPL 命令分发：内置命令 + 外部命令（M10）。返回 True=已处理，False=交给 LLM。"""
+    if text == "/help":
+        console.print(HELP)
+        if ctx.ext_commands:
+            console.print("[bold]外部命令：[/bold]")
+            for name in sorted(ctx.ext_commands):
+                console.print(f"  /{name}  （~/.vgent/commands/{name}.py）", markup=False)
+        return True
+    if text == "/new":
+        ctx.session_id = ctx.store.create_session()
+        _remember_session(last_path, ctx.session_id)
+        ctx.engine.compacted = None
+        tokens["n"] = 0
+        console.print(f"[dim]已新建会话 {ctx.session_id[:8]}[/dim]")
+        return True
+    if text in ("/resume", "/list", "/list-sessions"):
+        _resume_inline(ctx, console, prompt, last_path, action=text)
+        if text == "/resume":  # 切换会话：清掉压缩底稿与累计
+            ctx.engine.compacted = None
+            tokens["n"] = 0
+        return True
+    if text in ("/delete", "/delete-session"):
+        _delete_inline(ctx, console, prompt)
+        return True
+    if text == "/compact":
+        _compact_inline(ctx, console)
+        return True
+    if text == "/plan" or text.startswith("/plan "):
+        _plan_inline(ctx, console, redo=("new" in text or "redo" in text))
+        return True
+    if text == "/reflect":
+        _reflect_inline(ctx, console)
+        return True
+    if text == "/memories" or text == "/remember":
+        _memories_inline(ctx, console)
+        return True
+    if text.startswith("/remember "):
+        _remember_inline(ctx, console, text[len("/remember ") :].strip())
+        return True
+    if text.startswith("/recall "):
+        _recall_inline(ctx, console, text[len("/recall ") :].strip())
+        return True
+    if text == "/mcp":
+        _mcp_inline(ctx, console)
+        return True
+    if text == "/reasoning":
+        ctx.show_reasoning = not ctx.show_reasoning
+        console.print(f"[dim]思考过程展示：{'开' if ctx.show_reasoning else '关'}[/dim]")
+        return True
+    # M10：外部命令（~/.vgent/commands/<name>.py 的 run(ctx, args)）；内置优先，这里兜底
+    if text.startswith("/") and len(text) > 1:
+        cmd, _, args = text[1:].partition(" ")
+        run = ctx.ext_commands.get(cmd)
+        if run is not None:
+            try:
+                out = run(ctx, args.strip())
+            except Exception as exc:  # noqa: BLE001 — 外部命令异常也要回到输入，不崩溃
+                console.print(f"[red]外部命令 /{cmd} 出错：{exc}[/red]")
+            else:
+                if out:
+                    console.print(out, markup=False)
+            return True
+    return False
+
+
 def _repl(
     ctx: SessionContext,
     console: Console,
     prompt: Callable[[str], str],
     last_path: Path,
+    tokens: dict,
 ) -> None:
     console.print(f"[dim]会话 {ctx.session_id[:8]} 开始（/help 查看命令）[/dim]")
-    session_tokens = 0  # M4 状态栏：本会话累计 token（切换会话时清零）
     while True:
         try:
             text = prompt("你> ")
@@ -325,34 +504,7 @@ def _repl(
             continue
         if text in ("/exit", "/quit"):
             break
-        if text == "/help":
-            console.print(HELP)
-            continue
-        if text == "/new":
-            ctx.session_id = ctx.store.create_session()
-            _remember_session(last_path, ctx.session_id)
-            ctx.engine.compacted = None
-            session_tokens = 0
-            console.print(f"[dim]已新建会话 {ctx.session_id[:8]}[/dim]")
-            continue
-        if text in ("/resume", "/list", "/list-sessions"):
-            _resume_inline(ctx, console, prompt, last_path, action=text)
-            if text == "/resume":  # 切换会话：清掉压缩底稿与累计
-                ctx.engine.compacted = None
-                session_tokens = 0
-            continue
-        if text in ("/delete", "/delete-session"):
-            _delete_inline(ctx, console, prompt)
-            continue
-        if text == "/compact":
-            _compact_inline(ctx, console)
-            continue
-        if text == "/plan" or text.startswith("/plan "):
-            _plan_inline(ctx, console, redo=("new" in text or "redo" in text))
-            continue
-        if text == "/reasoning":
-            ctx.show_reasoning = not ctx.show_reasoning
-            console.print(f"[dim]思考过程展示：{'开' if ctx.show_reasoning else '关'}[/dim]")
+        if _dispatch_command(text, ctx, console, prompt, last_path, tokens):
             continue
         try:
             console.print("[cyan]assistant>[/cyan] ", end="")
@@ -371,13 +523,13 @@ def _repl(
             )
             console.print()
             if result.usage:  # M4 状态栏：token 用量（M6 加计划进度与状态）
-                session_tokens += result.usage.total_tokens
+                tokens["n"] += result.usage.total_tokens
                 parts = [
                     (
                         f"tok ↑{result.usage.prompt_tokens} ↓{result.usage.completion_tokens} "
                         f"= {result.usage.total_tokens}"
                     ),
-                    f"会话累计 {session_tokens}",
+                    f"会话累计 {tokens['n']}",
                 ]
                 if ctx.engine.compression_count:
                     parts.append(f"压缩 {ctx.engine.compression_count} 次")
@@ -457,6 +609,98 @@ def _plan_inline(ctx: SessionContext, console: Console, redo: bool = False) -> N
     for i, step in enumerate(plan.steps, 1):
         icon = icons.get(step.status, "·")
         console.print(f"  {i}. {icon} {step.description}", markup=False)
+
+
+def _reflect_inline(ctx: SessionContext, console: Console) -> None:
+    """M7：手动反思最近历史（LLM 分析失败并给修正动作），结果落库为 system 消息。"""
+    msgs = ctx.store.get_history(ctx.session_id)
+    if len(msgs) < 2:
+        console.print("[yellow]会话太短，无需反思。[/yellow]")
+        return
+    console.print("[dim]正在反思（分析失败原因与修正动作）……[/dim]")
+    note = reflect(msgs, ctx.llm)
+    if not note:
+        console.print("[red]反思未产出内容（LLM 失败或空响应）。[/red]")
+        return
+    ctx.store.add_message(ctx.session_id, Message("system", f"[反思] {note}"))
+    first = note.splitlines()[0][:80] if note else ""
+    console.print(f"[dim]已写入反思：{first}[/dim]")
+
+
+def _remember_inline(ctx: SessionContext, console: Console, topic: str) -> None:
+    """M8：/remember <主题>——LLM 摘要当前会话并存入本机记忆（episodic）。"""
+    if ctx.memory is None:
+        console.print("[red]记忆未启用。[/red]")
+        return
+    if not topic:
+        console.print("[yellow]用法：/remember <主题>（如：/remember 优化 git 仓库性能）[/yellow]")
+        return
+    msgs = ctx.store.get_history(ctx.session_id)
+    if len(msgs) < 2:
+        console.print("[yellow]会话太短，无可整理内容。[/yellow]")
+        return
+    console.print("[dim]正在整理会话记忆……[/dim]")
+    summary = summarize(msgs, ctx.llm, topic)
+    if not summary:
+        console.print("[red]记忆整理失败（LLM 无响应）。[/red]")
+        return
+    title = ctx.store.get_title(ctx.session_id) or topic
+    ctx.memory.add(topic, summary, ctx.session_id, title)
+    first = summary.splitlines()[0][:80] if summary else ""
+    console.print(f"[dim]已记住（{topic}）：{first}[/dim]")
+
+
+def _recall_inline(ctx: SessionContext, console: Console, keyword: str) -> None:
+    """M8：/recall <关键词>——检索记忆并作为 system 消息写入会话（持久可见）。"""
+    if ctx.memory is None:
+        console.print("[red]记忆未启用。[/red]")
+        return
+    if not keyword:
+        console.print("[yellow]用法：/recall <关键词>[/yellow]")
+        return
+    hits = ctx.memory.search(keyword, limit=3)
+    if not hits:
+        console.print(f"[yellow]没有匹配「{keyword}」的历史记忆。[/yellow]")
+        return
+    for e in hits:
+        ctx.store.add_message(
+            ctx.session_id,
+            Message("system", f"[记忆] {e.topic}（{e.ts[:10]}）：{e.summary}"),
+        )
+    console.print(f"[dim]已注入 {len(hits)} 条记忆（后续对话可见）。[/dim]")
+
+
+def _memories_inline(ctx: SessionContext, console: Console) -> None:
+    """M8：/memories——列出最近的任务摘要。"""
+    if ctx.memory is None:
+        console.print("[red]记忆未启用。[/red]")
+        return
+    entries = ctx.memory.list_recent(10)
+    if not entries:
+        console.print(
+            "[yellow]还没有任何历史记忆（用 /remember <主题> 记住当前会话）。[/yellow]"
+        )
+        return
+    console.print("[bold]历史记忆：[/bold]")
+    for e in entries:
+        first = e.summary.splitlines()[0] if e.summary else ""
+        console.print(f"  {e.ts[:16]} [{e.topic}] {first[:60]}", markup=False)
+
+
+def _mcp_inline(ctx: SessionContext, console: Console) -> None:
+    """M9：列出已加载的 MCP 工具（server → 带前缀工具名）。"""
+    if not ctx.mcp_tools:
+        console.print(
+            "[yellow]未配置 MCP 服务器（config.toml 的 [mcp.servers.<name>]，"
+            "command/args 指向本地 server 启动命令）。[/yellow]"
+        )
+        return
+    console.print("[bold]已加载的 MCP 工具：[/bold]")
+    for server, names in ctx.mcp_tools.items():
+        if names:
+            console.print(f"  {server}: {', '.join(names)}", markup=False)
+        else:
+            console.print(f"  {server}: [red]加载失败（启动时已跳过）[/red]")
 
 
 def _compact_inline(ctx: SessionContext, console: Console) -> None:

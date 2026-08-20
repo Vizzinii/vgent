@@ -2,7 +2,7 @@
 
 > 多端轮流工作用的状态文件。**在另一台机器上开工前，先读本文件**，确认上一位「我」问了什么、定了什么、停在哪。
 > 工作区在百度网盘同步盘，本文件随盘同步。
-> 最近更新：2026-08-21（**M6 完成并真终端验收 + 收尾修复**：99 测试全绿；真机跑出计划生成→/plan 逐条勾选→状态栏「计划 3/3」；修复 shell 输出 GBK 解码崩溃、注入工作目录锚点、search 跳过 .zcode/.cache、计划收尾偶发失效（reasoning 兜底 + 提示语强化）；收尾冒烟 3/3 done、3.2K tokens。下一步：M7 反思循环）
+> 最近更新：2026-08-21（**M10 zcode 化收尾 ✅ 完成，v2 演进 MVP 全部收官**：AGENTS.md 项目指令注入 + 外部命令扩展 + REPL 补全/常驻状态栏；M8 跟进修复 /remember 摘要质量；163 测试全绿。下一步：v2 明确不做清单之外的用户拍板项）
 
 ## 一句话定位
 
@@ -273,17 +273,49 @@ HANDOFF.md
     - **搜索噪音**：search 会扫进 `.zcode`/`.cache`（agent 会话产物/缓存）→ 加入 `_SKIP_DIRS`。
     - **计划收尾不稳定（2026-08-21 再修）**：收尾标齐偶发不生效——模型把计划块放进思考流（content 空）解析不到 → `plan_from_messages` 增加 reasoning_content 兜底 + 收尾提示语明确「正文直接输出，不要放思考里」；实测 3/3 done 稳定。
     - 测试 97 → **99 passed**、ruff 全绿；收尾冒烟（项目目录启动）：read_file 相对路径成功、无乱找、3.2K tokens、计划 3/3 done、状态 completed 落库。全局命令已 `uv tool install . --force` 重装。
-- **M7 反思循环 — 未开始**（依赖 M6，见「v2 演进 MVP」）。
+- **M7 反思循环 — ✅ 2026-08-21 完成**：`reflection.py`（失败信号启发式 + 反思调用）+ agent 接线 + `/reflect` 手动命令。
+  - `reflection.py`：`looks_failed`（shell 非零退出 / 明确错误关键词；exit 0 只认 FAILED/Traceback 强信号，保守防误判）+ `reflect(msgs, llm)`（最近 20 条足够，输出 Failure/Action 两行；异常/空响应静默返回 ""）+ `MAX_REFLECT_ROUNDS=3`。
+  - `agent.py`：run_turn 工具循环内——任一工具结果 `looks_failed` 且反思未超限 → 调 reflect() 一次，产出 `[反思] Failure/Action` system 消息注入**下一轮发送列表**（不落库，一次性引导）；模型据反思修正重试；超限后不再注入（防死循环烧 token）。**直接回应 M3 冒烟遗留**：模型拼错工具名连错 5 次烧 token——失败后不再靠模型瞎猜，显式给修正动作。
+  - `cli.py`：`/reflect` 手动命令（LLM 分析最近历史，结果以 system 消息**落库**——与自动反思不落库区分，用户主动要求则持久可见）。
+  - 测试：新增 test_reflection.py 9 例 + test_agent +3（失败→反思→修正成功 / 成功不反思 / 上限封顶）+ test_cli +2（短会话提示 / LLM 无响应不落库）；适配 3 个现有失败测试（拒绝/未知工具/坏参数，各补反思响应并断言注入）→ 99 → **113 passed**、ruff 全绿。
+  - 真机冒烟 ✅（tokenrhythm）：read_file 不存在路径失败 → 反思 1 次注入 → 模型改用 shell ls + find 修正 → 完整闭环（8 条历史、2.4K tokens、LLM 调用 5 次含 1 次反思）。全局命令已 `uv tool install . --force` 重装。
+  - **已知边界**：启发式失败判定可能漏判/误判（保守偏向不触发）；自动反思不落库（恢复会话后反思不保留，属预期）；反思调用本身消耗 token（上限 3 控制）。
+- **M8 episodic 记忆 — ✅ 2026-08-21 完成**：`memory/episodic.py` + agent/cli/config 接线。
+  - `memory/episodic.py`：`EpisodicMemory`（append-only JSONL，`~/.vgent/memory/episodic.jsonl`，不进同步盘；`add`/`search`（关键词**双向**子串匹配、大小写不敏感）/`list_recent`/`has_session`/`count`；坏行跳过）+ `summarize(msgs, llm, topic)`（最近 30 条窗口，3~5 句「做了什么/结论/遗留」，异常/空响应返回 ""，best-effort 不阻断）。
+  - `agent.py`：SessionContext +`memory`/`memory_auto`（默认 None/False，旧测试无感）；①**自动回忆**——用户消息命中已存主题 → `[记忆]` system 消息一次性注入首个 LLM 调用（不落库；历史已有同主题则跳过防重）；②**任务完成自动摘要**——`memory_auto=true` 且计划全 done → 回合结束自动 summarize 并存储（`has_session` 去重，每会话一次）。
+  - `cli.py`：`/remember <主题>`（LLM 摘要存本机）、`/recall <关键词>`（检索并**落库**注入 `[记忆]` system 消息）、`/memories`（列出最近 10 条）；`config.py` +`memory_auto`（顶层，默认 false）。
+  - 测试：新增 test_memory.py 8 例 + test_agent 5 例（自动回忆注入/不匹配不注入/历史已有防重/memory=None no-op/计划完成自动存+去重）+ test_cli 5 例 → 113 → **131 passed**、ruff 全绿。
+  - 真机冒烟 ✅（tokenrhythm）：会话 A 执行任务 → `/remember` 等价（summarize+add）存 1 条 → 会话 B「上次那个 vgent 项目…」**自动注入 `[记忆]`=True**、模型仅凭注入记忆一句话回答（无工具探索，历史 4 条）；JSONL 内容正确（ts/session_id/title/topic/summary）。
+  - **踩坑**：① 自动回忆匹配方向——需要「主题出现在用户消息里」而非「关键词在主题里」，`search` 改双向匹配（单测先暴露）；② 冒烟脚本会话 B 漏传 memory 导致注入 False（脚本问题，非代码缺陷）。
+  - **已知边界**：关键词检索为子串匹配（中文无分词，需用户提到完整主题词才命中；向量检索是 v2 可选项）；自动摘要仅 `memory_auto=true` 时触发（默认关，防意外 token 消耗）；`/exit` 退出不自动存（显式 `/remember` 或计划完成自动，符合「任务粒度」设计）。
+- **M9 MCP client — ✅ 2026-08-21 完成**：`src/vgent/mcp/` 包（stdio 连本地 MCP server，工具注册进 ToolRegistry）。
+  - `mcp/client.py`：MCPServerTool 转换（1.x `inputSchema` 驼峰 / 2.x `input_schema` 兼容读取）；`call_server_tool`（文本块拼接、isError 标记、10K 输出上限、异常转错误文本——决策 9 回喂模型自纠正）；`load_into_registry`（前缀 `<server>_<tool>` 防冲突、失败 server 跳过不阻塞启动）；sync 适配——**每次调用专用事件循环** + wait_for（60s 超时）+ 异常处理器吞掉 mcp 传输 teardown 噪音。
+  - `config.py`：+`MCPServerConfig`（command/args/cwd/permission，**默认 exec**——外部能力保守需确认）与 `[mcp.servers.<name>]` 解析（无 command 跳过、非法 permission 回 exec）。
+  - `cli.py`：启动 `load_into_registry` 加载 + 打印「MCP: \<name\>（N 工具）/加载失败」；`/mcp` 列出；SessionContext +mcp_tools。`scripts/mcp_echo_server.py` 冒烟用最小 server（FastMCP：echo/add）。
+  - **踩坑（跨机重要）**：① mcp 2.0.0 的 stdio 传输任务组在 loop 关闭时报 `exit cancel scope in different task`（asyncio.run 是后台噪音、anyio.run 直接进调用）→ **钉 `mcp<2`（1.29.0）**；1.x 仍有 teardown 噪音（cancel scope RuntimeError + Task was destroyed），用专用 loop + `_teardown_silencer` + 退出窗口吞掉 ② Windows 上 `stdio_client` 的 errlog 必须是真文件（要 `fileno()`），自定义 TextIO 会崩——server 侧噪音由 server 自控（echo server `log_level=WARNING` + 压 pydantic_settings warning）③ mcp 1.x 字段驼峰（`inputSchema`/`isError`），2.x 蛇形——兼容读取 ④ `asyncio.run` 无法设 exception handler，需自建 loop。
+  - 测试：新增 `tests/test_mcp.py` 10 例（fake session 单测 8 + 真实 stdio echo server 集成 1 + 前缀 1）+ test_config 2 例 → 131 → **143 passed**、ruff 全绿。
+  - 真机冒烟 ✅（tokenrhythm + 本地 echo server）：启动加载 `{'echo': ['echo_echo','echo_add']}` → 模型并行调用两个 MCP 工具（echo 返回原文、add 算 579）→ 全程无噪音无 traceback，1.29K tokens。
+  - **遗留（v2 可选）**：每次调用重建 stdio 连接（本地进程开销可接受，常驻连接留后续）；streamable HTTP / SSE 传输未做（只 stdio）；server 侧 stderr 噪音由各 server 自控；`/mcp` 仅列出不提供开关（要禁用直接删 config 段）。
+
+- **M8 跟进修复：/remember 摘要质量（2026-08-21）**：真机验收发现 `/remember` 存进对话碎片（`好的，我再试一次。`）而非摘要——deepseek 思考模式下模型把摘要放思考流、正文只吐一句碎片。修复 `memory/episodic.py` 的 `summarize`：① prompt 强化（3~5 句要点、覆盖做了什么/结论/遗留、**禁止复述对话原句**）；② 正文过短（<20 字符）时退回 `reasoning_content`；③ 仍过短判失败返回 ""（不写入）。
+  验证：161 → **163 passed**（+2：思考流回退、碎片拒绝）、ruff 全绿；真实模型（tokenrhythm）实测摘要从碎片变为 171 字符结构化要点（4 条 bullet：工具识别/权限归类/无遗留）。全局命令已 `--force` 重装。
+- **M10 zcode 化收尾 — ✅ 2026-08-21 完成**（v2 演进 MVP 收官）：
+  - `workspace.py`（新）：`find_instructions(cwd)`——从工作目录向上（8 层上限）找最近 `AGENTS.md`（`CLAUDE.md` 兜底），8K 字符截断；`agent.py` `SessionContext.instructions/instructions_name` + 首轮与 cwd_anchor 同模式注入（不落库、一次性）；`cli.py` 启动解析并打印「已加载项目指令」。
+  - `commands.py`（新）：`load_commands(dir)`——`~/.vgent/commands/<name>.py` 约定 `run(ctx, args: str) -> str`（返回文本 REPL 打印），importlib 加载、坏文件/无 run()/非法文件名跳过并记日志；`cli.py` 启动加载 + `_dispatch_command` 外部队列（内置命令优先，异常捕获不崩溃），`/help` 动态列出外部命令。
+  - REPL 体验：`_make_prompter(completions)`（WordCompleter 补全内置+外部命令）+ `_make_repl_prompter`（`bottom_toolbar` 常驻状态栏：provider/模型、Agent 状态、计划 done/total、会话累计 token）；`input()` 回退路径无补全/工具栏但不影响功能。`_repl` 命令链抽成 `_dispatch_command(text, ctx, console, prompt, last_path, tokens) -> bool`（可单测）。
+  - 测试：143 → **161 passed**（+18：test_workspace 7、test_commands 6、test_agent 2（首轮注入/不注入不报错）、test_cli 3（外部命令分发/内置优先/异常不崩））、ruff 全绿。
+  - 冒烟 ✅（管道 + VGENT_HOME 临时目录）：启动打印「外部命令：greet」「已加载项目指令 AGENTS.md（18 字符）」→ `/greet vgent` 输出「你好，vgent！外部命令可用」→ `/help` 含外部命令说明 → `/exit` 干净退出。
+  - **已知边界**：补全/常驻状态栏仅 prompt_toolkit 路径（真终端）；外部命令仅 Python 文件（不支持任意脚本解释器，够用）；AGENTS.md 注入不落库（恢复会话不重注入，属预期）；指令上限 8K 字符。
 
 ## v2 演进 MVP（✅ 2026-08-20 方向拍板：web UI 取消，走 zcode 化；M6 起延续 M 编号）
 
 设计原则沿用：各取所长、轻量、每步 FakeLLM 单测 + tokenrhythm 真机冒烟、完成后回写本日志。
 
 - **M6 任务管理 + 状态机（P0 地基）✅ 完成**：`task.py`（TaskPlan/TaskStep，计划以带标记的 system 消息进历史，随 SQLite 持久化，恢复会话即恢复计划；模型维护步骤状态）+ `state.py`（AgentState 枚举，当前状态随轮次落库）；`agent.py` 接线、`cli.py` 加 `/plan` 与状态展示。
-- **M7 反思循环（P1）**：`reflection.py`——失败信号（工具非零/错误关键词/测试失败/用户拒绝）时追加一次 LLM 反思调用（原因+修正动作）回喂并允许重试，独立 REFLECT_ROUNDS 上限；`/reflect` 手动 + 自动启发式触发。
-- **M8 episodic 记忆（P2）**：`memory/episodic.py`——会话结束/任务完成时 LLM 生成任务摘要（做了什么/结论/遗留）存本机，`/remember` 关键词检索注入上下文；向量检索可选后续。
-- **M9 MCP client（P2）**：`mcp/client.py`——官方 mcp SDK，stdio 连本地 server，工具注册进 ToolRegistry（前缀防冲突），config 加 `[mcp.servers.<name>]`；只做 client。
-- **M10 zcode 化收尾**：AGENTS.md 项目指令注入 + 外部命令扩展（~/.vgent/commands）+ REPL 补全/状态栏常驻。
+- **M7 反思循环（P1）✅ 完成（2026-08-21）**：`reflection.py`——失败信号启发式 + 显式反思（Failure/Action）注入重试，`MAX_REFLECT_ROUNDS=3` 上限；`/reflect` 手动命令（落库）。见构建日志。
+- **M8 episodic 记忆（P2）✅ 完成（2026-08-21）**：`memory/episodic.py`（JSONL 存储 + LLM 摘要）；`/remember`（存）/`/recall`（检索注入落库）/`/memories`（列出）；自动回忆注入 + `memory_auto` 任务完成自动摘要（默认关）。见构建日志。
+- **M9 MCP client（P2）✅ 完成（2026-08-21）**：`mcp/` 包——官方 mcp SDK（钉 <2，1.29.0），stdio 连本地 server，工具注册进 ToolRegistry（前缀防冲突），config 加 `[mcp.servers.<name>]`；只做 client。见构建日志。
+- **M10 zcode 化收尾 ✅ 完成（2026-08-21）**：AGENTS.md/CLAUDE.md 项目指令注入（workspace.py）+ 外部命令扩展（commands.py）+ REPL 补全与常驻底部状态栏（prompt_toolkit）。见构建日志。
 - **v2 明确不做**：web UI、多 Agent、向量语义检索、MCP server 宿主、遥测平台、prompt YAML 框架化、Capability/Tool Provider 抽象。
 
 ## 用法约定

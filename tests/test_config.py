@@ -118,3 +118,27 @@ def test_show_reasoning_config(tmp_path) -> None:
     p = tmp_path / "config.toml"
     p.write_text("show_reasoning = true\n", encoding="utf-8")
     assert load_config(p).show_reasoning is True
+
+
+def test_mcp_servers_parsed(tmp_path) -> None:
+    """M9：配置解析 [mcp.servers.<name>]（command/args/permission；无 command 跳过）。"""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[mcp.servers.echo]\ncommand = "python"\nargs = ["s.py", "--x"]\n'
+        '[mcp.servers.notes]\ncommand = "node"\npermission = "write"\n'
+        '[mcp.servers.bad]\npermission = "read"\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(p)
+    assert set(cfg.mcp_servers) == {"echo", "notes"}
+    echo = cfg.mcp_servers["echo"]
+    assert echo.command == "python"
+    assert echo.args == ["s.py", "--x"]
+    assert echo.permission == "exec"  # 默认
+    assert cfg.mcp_servers["notes"].permission == "write"
+
+
+def test_mcp_bad_permission_defaults_exec(tmp_path) -> None:
+    p = tmp_path / "config.toml"
+    p.write_text('[mcp.servers.x]\ncommand = "python"\npermission = "sudo"\n', encoding="utf-8")
+    assert load_config(p).mcp_servers["x"].permission == "exec"

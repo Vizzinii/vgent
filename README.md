@@ -2,9 +2,9 @@
 
 通用 agent CLI（运行时 harness）——参考 hermes-agent / openai-agents-python / OpenManus / MetaGPT 等主流实现，各取所长。默认模型 DeepSeek（OpenAI-compatible）。
 
-**状态**：**v1 完成**——M0-M4 ✅ + M5 收尾 ✅（write_file/search 补齐、错误重试、测试补强，2026-08-20）。设计文档与跨机交接见 [HANDOFF.md](HANDOFF.md)。
+**状态**：v1 完成（M0-M5 ✅，2026-08-20）；v2 演进——M6 任务管理/状态机 ✅、M7 反思循环 ✅、M8 episodic 记忆 ✅、M9 MCP client ✅、M10 zcode 化收尾 ✅（2026-08-21）。设计文档与跨机交接见 [HANDOFF.md](HANDOFF.md)。
 
-内置工具：`shell`（exec 档，需确认）、`write_file`（write 档，需确认）、`read_file` / `search`（read 档，自动放行）。REPL 里 `/reasoning` 可切换流式展示模型思考过程（默认关；`config.toml` 顶层 `show_reasoning = true` 可默认开）。
+内置工具：`shell`（exec 档，需确认）、`write_file`（write 档，需确认）、`read_file` / `search`（read 档，自动放行）。REPL 里 `/reasoning` 可切换流式展示模型思考过程（默认关；`config.toml` 顶层 `show_reasoning = true` 可默认开）；`/remember <主题>` 记住当前会话、`/recall <关键词>` 检索历史记忆并注入、`/memories` 列出（episodic 记忆存本机 `~/.vgent/memory/episodic.jsonl`；`config.toml` 顶层 `memory_auto = true` 可在任务计划完成时自动存摘要）。
 
 ## 运行
 
@@ -26,7 +26,13 @@ vgent --new                 # 跳过会话选择，直接新建
 vgent --provider <name>     # 临时切换 provider
 ```
 
-配置在 `~/.vgent/config.toml`：多 provider（`[providers.<name>]` 定义、`[provider] active` 选择，启动可 `vgent --provider <name>` 临时切换；api_key 用文件字段或每 provider 独立的 `api_key_env` 环境变量）。未配置 key 时对话会报 401，但 REPL 不崩溃。
+配置在 `~/.vgent/config.toml`：多 provider（`[providers.<name>]` 定义、`[provider] active` 选择，启动可 `vgent --provider <name>` 临时切换；api_key 用文件字段或每 provider 独立的 `api_key_env` 环境变量）；MCP（`[mcp.servers.<name>]` 挂本地 MCP server，stdio 拉起，工具以 `<server>_<tool>` 前缀进入工具面，`/mcp` 查看；示例见 `scripts/mcp_echo_server.py`）。未配置 key 时对话会报 401，但 REPL 不崩溃。
+
+## 项目指令与外部命令（M10，zcode 化收尾）
+
+- **AGENTS.md 项目指令**：启动时从工作目录向上找最近的 `AGENTS.md`（`CLAUDE.md` 兜底，8 层上限、8K 字符截断），内容注入首个 LLM 调用（不落库、一次性）——把项目约定写进去即可生效。
+- **外部命令**：`~/.vgent/commands/<name>.py` 里定义 `run(ctx, args: str) -> str`（返回文本由 REPL 打印），REPL 里用 `/<name> 参数` 调用；内置命令优先，坏文件跳过不阻塞启动。
+- **REPL 体验**：prompt_toolkit 下输入 `/` 有命令补全；输入行底部常驻状态栏显示 provider/模型、Agent 状态、计划进度、会话累计 token（Git Bash/管道回退 `input()` 时无补全与工具栏，功能不受影响）。
 
 ## 双机开发注意事项（M1 新增）
 
