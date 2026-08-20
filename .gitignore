@@ -5,3 +5,6 @@ __pycache__/
 .ruff_cache/
 dist/
 *.egg-info/
+
+# 跨端交接文档（私有，不进公开仓库）
+HANDOFF.md
