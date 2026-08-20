@@ -2,7 +2,7 @@
 
 > 多端轮流工作用的状态文件。**在另一台机器上开工前，先读本文件**，确认上一位「我」问了什么、定了什么、停在哪。
 > 工作区在百度网盘同步盘，本文件随盘同步。
-> 最近更新：2026-08-20（**v1 收官 + 真机首跑修复**：M0-M5 全部完成（81 测试全绿 + tokenrhythm 冒烟）；真终端首跑验证三体验正常，修复 shell 非标准路径解析 / httpx2 日志噪音 / banner 富文本吞名 3 个 bug（83 passed）。下一步：v2 backlog——web UI / async 重构）
+> 最近更新：2026-08-21（**M6 完成并真终端验收 + 收尾修复**：99 测试全绿；真机跑出计划生成→/plan 逐条勾选→状态栏「计划 3/3」；修复 shell 输出 GBK 解码崩溃、注入工作目录锚点、search 跳过 .zcode/.cache、计划收尾偶发失效（reasoning 兜底 + 提示语强化）；收尾冒烟 3/3 done、3.2K tokens。下一步：M7 反思循环）
 
 ## 一句话定位
 
@@ -260,7 +260,31 @@ HANDOFF.md
   - **banner 吞 provider 名**：`[{cfg.provider.name}]` 被 rich 当样式标签吞掉（显示成 `—  model`）→ 转义 `\[name\]`；顺带会话标题/确认参数/工具输出行加 rich 转义（`markup=False` / `escape`），防含 `[]` 的用户文本被当样式解析。
   - 测试 81 → **83 passed**（+2：git 根推断、注册表解析）、ruff 全绿。
   - 体验确认 ✅：确认交互（y 一次 / a sticky / 拒绝回喂）、状态栏（`tok ↑↓=total；会话累计`，复测累计 1361+1462=2823 正确）、思考展示（`/reasoning` dim 渲染；trivial 任务模型可能不输出思考，属正常）、title 自动生成、`/list`、`/compact` 短历史预期行为、**`vgent --resume` 实测直接恢复上次会话**。使用注意：`vgent --resume` 是 shell 命令，须先 `/exit` 再在终端执行（在 REPL 里输入会被当消息发给模型，实测烧 ~5.9K tokens）。
-- **v2 backlog（未排期）**：web UI（`serve` 模式，FastAPI + SSE，复用 SessionContext；async 重构——决策 10 预留）；会话导出；权限策略配置化。
+- **M6 任务管理 + 状态机 — ✅ 2026-08-20 完成**：`task.py`（TaskPlan/TaskStep，`[vgent-plan]` 块解析/序列化）+ `state.py`（AgentState 六态）。
+  - 机制：无计划时首轮注入规划提示（不落库）→ 模型在**正文**输出 `[vgent-plan]` JSON 块 → 解析后以 system 消息 upsert 进历史（只留最新一份，恢复会话即恢复计划）；工具执行后轻推模型同步状态；回合结束计划未全 done 时追加一次「收尾标齐」调用（不落库、失败不阻断）；坏 JSON/模型未输出自动回退无计划模式。
+  - 接线：`store.py` +session_states 表（set_state/get_state）+ upsert_plan_message/clear_plan；`agent.py` SessionContext 加 plan/state，run_turn 状态转场（PLANNING→EXECUTING→WAITING_PERMISSION→COMPLETED/FAILED）随轮次落库；`cli.py` `/plan`（查看）、`/plan new`（重做）+ 状态栏加「计划 done/total」与状态。
+  - 测试：新增 test_task.py 7 例 + store 2 例 + agent 5 例（生成/更新/恢复/坏 JSON 回退/收尾标齐/状态落库），更新 4 处 send 断言 → 83 → **97 passed**、ruff 全绿。
+  - 真机冒烟 ✅（tokenrhythm）：多步任务 → 3 步计划生成（强化提示「正文输出、别放思考里」后稳定）→ 工具执行 → 收尾标齐 3/3 done → 状态 completed 落库；~3.4K tokens。
+  - **踩坑（M6）**：① 正则被 plan_message 说明前缀里的字面量标记干扰 → 说明不再含标记 + 解析取最后一个块；② 模型倾向把规划放思考流（content 空）→ 提示语明确正文输出；③ 模型最终回复带未更新状态的计划块 → 收尾条件改为「非全 done 即触发」；④ 规划兜底调用破坏所有脚本化工具测试的调用计数 → 砍掉，回归「模型不配合则无计划」边界。
+  - **已知边界**：计划创建仍依赖模型配合（提示语强化后实测稳定，best-effort）；完整转场日志（非仅当前状态）未做。
+  - **M6 真终端验收 + 跟进修复（2026-08-21）**：用户在 PowerShell 真机跑通 M6——计划块正文生成、`/plan` 逐条勾选 ✓✓✓、状态栏「计划 3/3；状态 completed」全部符合预期。同时暴露 3 个问题已修：
+    - **shell 输出 GBK 解码崩溃（真 bug）**：`subprocess.run(text=True)` 在中文 Windows 用 GBK 解码头输出，UTF-8 字节（ls/find 中文名）触发 `UnicodeDecodeError`，输出全丢 → 显式 `encoding="utf-8", errors="replace"`（+回归测试 test_shell_utf8_output_no_crash）。
+    - **工作目录错位**：从非项目目录（如 C:\Users\vizzini）启动时相对路径全失败，模型全盘乱找烧 28K tokens → 新会话首轮注入「工作目录」system 锚点（不落库，只在首个 LLM 调用）。
+    - **搜索噪音**：search 会扫进 `.zcode`/`.cache`（agent 会话产物/缓存）→ 加入 `_SKIP_DIRS`。
+    - **计划收尾不稳定（2026-08-21 再修）**：收尾标齐偶发不生效——模型把计划块放进思考流（content 空）解析不到 → `plan_from_messages` 增加 reasoning_content 兜底 + 收尾提示语明确「正文直接输出，不要放思考里」；实测 3/3 done 稳定。
+    - 测试 97 → **99 passed**、ruff 全绿；收尾冒烟（项目目录启动）：read_file 相对路径成功、无乱找、3.2K tokens、计划 3/3 done、状态 completed 落库。全局命令已 `uv tool install . --force` 重装。
+- **M7 反思循环 — 未开始**（依赖 M6，见「v2 演进 MVP」）。
+
+## v2 演进 MVP（✅ 2026-08-20 方向拍板：web UI 取消，走 zcode 化；M6 起延续 M 编号）
+
+设计原则沿用：各取所长、轻量、每步 FakeLLM 单测 + tokenrhythm 真机冒烟、完成后回写本日志。
+
+- **M6 任务管理 + 状态机（P0 地基）✅ 完成**：`task.py`（TaskPlan/TaskStep，计划以带标记的 system 消息进历史，随 SQLite 持久化，恢复会话即恢复计划；模型维护步骤状态）+ `state.py`（AgentState 枚举，当前状态随轮次落库）；`agent.py` 接线、`cli.py` 加 `/plan` 与状态展示。
+- **M7 反思循环（P1）**：`reflection.py`——失败信号（工具非零/错误关键词/测试失败/用户拒绝）时追加一次 LLM 反思调用（原因+修正动作）回喂并允许重试，独立 REFLECT_ROUNDS 上限；`/reflect` 手动 + 自动启发式触发。
+- **M8 episodic 记忆（P2）**：`memory/episodic.py`——会话结束/任务完成时 LLM 生成任务摘要（做了什么/结论/遗留）存本机，`/remember` 关键词检索注入上下文；向量检索可选后续。
+- **M9 MCP client（P2）**：`mcp/client.py`——官方 mcp SDK，stdio 连本地 server，工具注册进 ToolRegistry（前缀防冲突），config 加 `[mcp.servers.<name>]`；只做 client。
+- **M10 zcode 化收尾**：AGENTS.md 项目指令注入 + 外部命令扩展（~/.vgent/commands）+ REPL 补全/状态栏常驻。
+- **v2 明确不做**：web UI、多 Agent、向量语义检索、MCP server 宿主、遥测平台、prompt YAML 框架化、Capability/Tool Provider 抽象。
 
 ## 用法约定
 

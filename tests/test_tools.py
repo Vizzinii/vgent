@@ -53,6 +53,14 @@ def test_shell_failure_exit_code() -> None:
     assert out.startswith("exit 3")
 
 
+def test_shell_utf8_output_no_crash() -> None:
+    """真机修复：中文 Windows（GBK locale）下 shell 输出含 UTF-8/非法字节不崩溃、不丢输出。"""
+    reg = default_tools()
+    out = reg.execute("shell", {"command": "echo 你好 vgent; printf '\\xff'"})
+    assert out.startswith("exit 0")
+    assert "你好 vgent" in out
+
+
 def test_read_file_with_line_numbers(tmp_path) -> None:
     p = tmp_path / "a.txt"
     p.write_text("l1\nl2\nl3\n", encoding="utf-8")

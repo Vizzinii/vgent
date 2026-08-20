@@ -48,6 +48,30 @@ def test_reasoning_content_roundtrip(tmp_path) -> None:
     store.close()
 
 
+def test_plan_message_upsert_and_clear(tmp_path) -> None:
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    store.upsert_plan_message(sid, '[vgent-plan]\n{"steps": [{"description": "a"}]}\n[/vgent-plan]')
+    store.upsert_plan_message(sid, '[vgent-plan]\n{"steps": [{"description": "b"}]}\n[/vgent-plan]')
+    plans = [m for m in store.get_history(sid) if "[vgent-plan]" in m.content]
+    assert len(plans) == 1  # 历史里只留最新一份
+    assert "b" in plans[0].content
+    store.clear_plan(sid)
+    assert all("[vgent-plan]" not in m.content for m in store.get_history(sid))
+    store.close()
+
+
+def test_session_state_roundtrip(tmp_path) -> None:
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    assert store.get_state(sid) is None
+    store.set_state(sid, "planning")
+    assert store.get_state(sid) == "planning"
+    store.set_state(sid, "completed")  # 覆盖
+    assert store.get_state(sid) == "completed"
+    store.close()
+
+
 def test_update_title(tmp_path) -> None:
     store = SessionStore(tmp_path / "t.db")
     sid = store.create_session()

@@ -147,10 +147,14 @@ def _shell_handler(args: dict) -> str:
     if shell is None:
         return "错误：未找到可用 shell（bash/sh）"
     try:
+        # 显式 UTF-8 + errors=replace：中文 Windows 默认 GBK 解码会崩（真机首跑踩坑），
+        # 输出含 UTF-8/非法字节时不能丢输出
         proc = subprocess.run(
             [shell, "-lc", cmd],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -190,8 +194,8 @@ def _read_file_handler(args: dict) -> str:
     return "\n".join(f"{i:>6}\t{ln}" for i, ln in enumerate(chunk, start=start + 1))
 
 
-# M5：搜索时跳过这些目录（避免拖慢 / 刷屏）
-_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache", ".ruff_cache", "dist", "build", ".idea", ".vscode", ".hg", ".svn"}
+# M5：搜索时跳过这些目录（避免拖慢 / 刷屏）；.zcode/.cache 为真机首跑补（会搜出 agent 会话产物）
+_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache", ".ruff_cache", "dist", "build", ".idea", ".vscode", ".hg", ".svn", ".zcode", ".cache"}
 _SEARCH_LINE_CAP = 200  # 匹配行单行截断
 _SEARCH_RESULT_CAP = 100  # 结果条数上限
 

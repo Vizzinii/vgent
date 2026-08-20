@@ -26,6 +26,7 @@ from vgent.llm import LLMClient
 from vgent.messages import Message
 from vgent.permission import ConfirmResult, PermissionSystem
 from vgent.store import SessionStore
+from vgent.task import plan_from_messages
 from vgent.tools import ToolSchema, default_tools
 
 HELP = """命令：
@@ -34,6 +35,7 @@ HELP = """命令：
   /list           列出会话
   /delete         删除会话（按编号，当前会话不可删）
   /compact        压缩当前会话（LLM 摘要中间历史，下次对话生效）
+  /plan           查看任务计划（/plan new 清除并重新规划）
   /reasoning      切换思考过程展示（开/关，默认关）
   /help           显示帮助
   /exit           退出
@@ -345,6 +347,9 @@ def _repl(
         if text == "/compact":
             _compact_inline(ctx, console)
             continue
+        if text == "/plan" or text.startswith("/plan "):
+            _plan_inline(ctx, console, redo=("new" in text or "redo" in text))
+            continue
         if text == "/reasoning":
             ctx.show_reasoning = not ctx.show_reasoning
             console.print(f"[dim]思考过程展示：{'开' if ctx.show_reasoning else '关'}[/dim]")
@@ -365,13 +370,22 @@ def _repl(
                 on_reasoning=on_reasoning,
             )
             console.print()
-            if result.usage:  # M4 状态栏：token 用量
+            if result.usage:  # M4 状态栏：token 用量（M6 加计划进度与状态）
                 session_tokens += result.usage.total_tokens
-                comp = f"；压缩 {ctx.engine.compression_count} 次" if ctx.engine.compression_count else ""
-                console.print(
-                    f"[dim]  tok ↑{result.usage.prompt_tokens} ↓{result.usage.completion_tokens} "
-                    f"= {result.usage.total_tokens}；会话累计 {session_tokens}{comp}[/dim]"
-                )
+                parts = [
+                    (
+                        f"tok ↑{result.usage.prompt_tokens} ↓{result.usage.completion_tokens} "
+                        f"= {result.usage.total_tokens}"
+                    ),
+                    f"会话累计 {session_tokens}",
+                ]
+                if ctx.engine.compression_count:
+                    parts.append(f"压缩 {ctx.engine.compression_count} 次")
+                if ctx.plan and ctx.plan.steps:
+                    done = sum(1 for s in ctx.plan.steps if s.status == "done")
+                    parts.append(f"计划 {done}/{len(ctx.plan.steps)}")
+                parts.append(f"状态 {ctx.state.value}")
+                console.print("[dim]  " + "；".join(parts) + "[/dim]")
         except Exception as exc:  # noqa: BLE001 — REPL 顶层兜底：任何错误都回到输入，不崩溃
             console.print(f"\n[red]调用失败：{exc}[/red]")
 
@@ -423,6 +437,26 @@ def _delete_inline(
         return
     ctx.store.delete_session(target.id)
     console.print(f"[dim]已删除会话 {target.id[:8]}[/dim]")
+
+
+def _plan_inline(ctx: SessionContext, console: Console, redo: bool = False) -> None:
+    """/plan：查看当前任务计划；/plan new（redo）清除计划，下次对话重新规划。"""
+    if redo:
+        ctx.store.clear_plan(ctx.session_id)
+        ctx.plan = None
+        console.print("[dim]已清除计划；下一条消息将重新规划[/dim]")
+        return
+    plan = plan_from_messages(ctx.store.get_history(ctx.session_id))
+    if plan is None:
+        console.print(
+            "[yellow]当前会话没有任务计划（简单任务无需计划；多步任务会在首轮生成）。[/yellow]"
+        )
+        return
+    icons = {"pending": "○", "running": "▶", "done": "✓", "failed": "✗"}
+    console.print("[bold]任务计划：[/bold]")
+    for i, step in enumerate(plan.steps, 1):
+        icon = icons.get(step.status, "·")
+        console.print(f"  {i}. {icon} {step.description}", markup=False)
 
 
 def _compact_inline(ctx: SessionContext, console: Console) -> None:

@@ -51,6 +51,12 @@ class SessionStore:
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(messages)")}
         if "reasoning_content" not in cols:
             self._conn.execute("ALTER TABLE messages ADD COLUMN reasoning_content TEXT")
+        # M6：Agent 状态（每轮结束写当前状态，供恢复/展示）
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_states ("
+            "session_id TEXT PRIMARY KEY REFERENCES sessions(id),"
+            "state TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
         self._conn.commit()
 
     def close(self) -> None:
@@ -125,6 +131,42 @@ class SessionStore:
         return [
             Message(r[0], r[1], r[2], _tool_calls_from_json(r[3]), r[4]) for r in rows
         ]
+
+    # -- M6：任务计划消息与会话状态 -------------------------------------------
+
+    def upsert_plan_message(self, session_id: str, text: str) -> None:
+        """替换会话里的计划消息：历史中只保留最新一份（LIKE 匹配标记）。"""
+        self._conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND role = 'system' "
+            "AND content LIKE '%[vgent-plan]%'",
+            (session_id,),
+        )
+        self.add_message(session_id, Message("system", text))
+
+    def clear_plan(self, session_id: str) -> None:
+        """/plan new：清掉计划消息，下次对话重新规划。"""
+        self._conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND role = 'system' "
+            "AND content LIKE '%[vgent-plan]%'",
+            (session_id,),
+        )
+        self._conn.commit()
+
+    def set_state(self, session_id: str, state: str) -> None:
+        """落当前 Agent 状态（M6：每轮结束写一次，供恢复/展示）。"""
+        self._conn.execute(
+            "INSERT INTO session_states (session_id, state, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, "
+            "updated_at = excluded.updated_at",
+            (session_id, state, _now()),
+        )
+        self._conn.commit()
+
+    def get_state(self, session_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT state FROM session_states WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return row[0] if row else None
 
 
 def _now() -> str:

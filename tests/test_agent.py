@@ -1,12 +1,15 @@
 """M1/M2 测试：agent 主循环（FakeLLM/ScriptedLLM 注入，不触网）。"""
 from __future__ import annotations
 
+import pytest
+
 from vgent.agent import SessionContext, run_turn
 from vgent.config import ContextConfig
 from vgent.context import ContextEngine
 from vgent.llm import ChatResult
 from vgent.messages import Message, ToolCall, Usage
 from vgent.permission import ConfirmResult, PermissionSystem
+from vgent.state import AgentState
 from vgent.store import SessionStore
 from vgent.tools import ToolRegistry, ToolSchema
 
@@ -67,9 +70,9 @@ def test_run_turn_persists_and_returns(tmp_path) -> None:
     assert hist[0].content == "帮我写段代码"
     assert hist[1].content == "你好"
 
-    # 第二轮应带上完整历史（user + assistant + 新 user）
+    # 第二轮应带上完整历史（M6：无计划时首条为规划提示 system 消息）
     run_turn("继续", ctx)
-    assert [m.role for m in llm.calls[1]] == ["user", "assistant", "user"]
+    assert [m.role for m in llm.calls[1]] == ["system", "user", "assistant", "user"]
     store.close()
 
 
@@ -234,7 +237,8 @@ def test_run_turn_prunes_old_tool_results(tmp_path) -> None:
     run_turn("继续", ctx)
 
     sent = llm.calls[0]
-    assert len(sent) == 10  # 9 条历史 + 1 条新 user（剪枝不改条数）
+    # 9 条历史 + 1 条新 user + 1 条规划提示（剪枝不改条数）
+    assert len(sent) == 11
     assert any(m.role == "tool" and "\n" not in m.content and "已摘要" in m.content for m in sent)
     recent_tools = [m.content for m in sent if m.role == "tool"][-2:]
     assert all("\n" not in c and "已摘要" not in c for c in recent_tools)  # 尾部未动
@@ -259,7 +263,7 @@ def test_run_turn_compresses_when_over_threshold(tmp_path) -> None:
     run_turn("再来", ctx)
 
     sent = llm.calls[0]
-    assert len(sent) < 41
+    assert len(sent) < 42  # 40 条历史 + user + 规划提示，压缩后更短
     assert any(m.role == "system" and "TailWindow" in m.content for m in sent)
     assert len(store.get_history(sid)) == 42  # 全量历史仍在库里
     store.close()
@@ -292,8 +296,8 @@ def test_compacted_base_used_in_send_list(tmp_path) -> None:
 
     run_turn("继续", ctx)
     sent = llm.calls[0]
-    assert sent[0].role == "system"
-    assert "历史摘要" in sent[0].content
+    assert sent[0].role == "system"  # M6：无计划时规划提示在最前
+    assert "历史摘要" in sent[1].content  # 压缩底稿紧随其后
     assert sent[-1].content == "继续"
     # store 全量：3 条历史 + 新 user + assistant 回复（压缩底稿不落库）
     assert len(store.get_history(sid)) == 5
@@ -342,4 +346,151 @@ def test_max_tool_rounds_safety_valve(tmp_path, monkeypatch) -> None:
     # store：user + 3*(assistant+tool) + 收尾 assistant = 8 条
     hist = store.get_history(sid)
     assert [m.role for m in hist] == ["user", "assistant", "tool", "assistant", "tool", "assistant", "tool", "assistant"]
+    store.close()
+
+
+# -- M6：任务计划（plan 消息化）与状态机 ---------------------------------------
+
+
+def _plan_block(steps_json: str) -> str:
+    return f"[vgent-plan]\n{steps_json}\n[/vgent-plan]"
+
+
+def test_plan_generated_persisted_and_updated(tmp_path) -> None:
+    """M6：模型输出计划 → 落库（历史只留一份）→ 状态变化后更新。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    reg = ToolRegistry()
+    executed = 0
+
+    def probe(args: dict) -> str:
+        nonlocal executed
+        executed += 1
+        return "ok"
+
+    reg.register(ToolSchema("probe", "探测", {"type": "object"}, "read"), probe)
+    llm = ScriptedLLM(
+        [
+            _chat_with_tools(
+                ToolCall("c1", "probe", "{}"),
+                content=_plan_block(
+                    '{"steps": [{"description": "扫描", "status": "pending"}, '
+                    '{"description": "修改", "status": "pending"}]}'
+                ),
+            ),
+            _chat_final(
+                _plan_block(
+                    '{"steps": [{"description": "扫描", "status": "done"}, '
+                    '{"description": "修改", "status": "done"}]}'
+                )
+            ),
+        ]
+    )
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, tools=reg)
+    run_turn("分析并修改", ctx)
+
+    assert executed == 1
+    assert ctx.plan is not None and len(ctx.plan.steps) == 2
+    assert ctx.plan.steps[0].status == "done"  # 第二个响应更新了状态
+    plans = [m for m in store.get_history(sid) if "[vgent-plan]" in m.content and m.role == "system"]
+    assert len(plans) == 1  # 历史里只留最新一份
+    assert "done" in plans[0].content
+    # 首轮发送列表以规划提示开头（无计划时注入）
+    assert llm.calls[0][0].role == "system"
+    assert "[vgent-plan]" in llm.calls[0][0].content
+    # 工具执行后：下一轮发送带「同步计划状态」轻推
+    assert llm.calls[1][0].role == "system"
+    assert "工具已执行完毕" in llm.calls[1][0].content
+    store.close()
+
+
+def test_plan_restored_on_resume(tmp_path) -> None:
+    """M6：新会话进程从 SQLite 恢复计划（且不再注入规划提示）。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    llm = ScriptedLLM(
+        [_chat_final(_plan_block('{"steps": [{"description": "a", "status": "pending"}]}'))]
+    )
+    ctx = SessionContext(session_id=sid, store=store, llm=llm)
+    run_turn("任务", ctx)
+
+    # 模拟重启：新上下文、同一 store（收尾会再标齐一次状态，需多一条响应）
+    llm2 = ScriptedLLM(
+        [
+            _chat_final("继续"),
+            _chat_final(_plan_block('{"steps": [{"description": "a", "status": "done"}]}')),
+        ]
+    )
+    ctx2 = SessionContext(session_id=sid, store=store, llm=llm2)
+    run_turn("继续", ctx2)
+    assert ctx2.plan is not None and ctx2.plan.steps[0].description == "a"
+    assert ctx2.plan.steps[0].status == "done"  # 收尾标齐
+    assert llm2.calls[0][0].role == "user"  # 有计划 → 不注入提示
+    store.close()
+
+
+def test_bad_plan_json_falls_back(tmp_path) -> None:
+    """M6：模型输出坏 JSON 计划 → 回退无计划模式，不落库不报错。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    llm = ScriptedLLM([_chat_final("[vgent-plan]\n{not json[/vgent-plan] 完成")])
+    ctx = SessionContext(session_id=sid, store=store, llm=llm)
+    run_turn("任务", ctx)
+    assert ctx.plan is None
+    assert all(
+        not (m.role == "system" and "[vgent-plan]" in m.content)
+        for m in store.get_history(sid)
+    )
+    store.close()
+
+
+def test_plan_finalized_at_turn_end(tmp_path) -> None:
+    """M6：回合结束模型未输出计划块 → 收尾调用把步骤状态标齐（done）。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    reg = ToolRegistry()
+
+    def probe(args: dict) -> str:
+        return "ok"
+
+    reg.register(ToolSchema("probe", "探测", {"type": "object"}, "read"), probe)
+    llm = ScriptedLLM(
+        [
+            _chat_with_tools(
+                ToolCall("c1", "probe", "{}"),
+                content=_plan_block('{"steps": [{"description": "扫描", "status": "pending"}]}'),
+            ),
+            _chat_final("完成（没有输出计划块）"),
+            _chat_final(_plan_block('{"steps": [{"description": "扫描", "status": "done"}]}')),
+        ]
+    )
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, tools=reg)
+    run_turn("任务", ctx)
+
+    assert len(llm.calls) == 3  # 计划 + 执行 + 收尾标齐
+    assert ctx.plan is not None and ctx.plan.steps[0].status == "done"
+    plans = [m for m in store.get_history(sid) if "[vgent-plan]" in m.content and m.role == "system"]
+    assert len(plans) == 1 and "done" in plans[0].content
+    store.close()
+
+
+def test_state_completed_and_failed(tmp_path) -> None:
+    """M6：正常结束 → completed 落库；LLM 异常 → failed 落库。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+
+    ctx = SessionContext(session_id=sid, store=store, llm=FakeLLM())
+    run_turn("正常", ctx)
+    assert ctx.state is AgentState.COMPLETED
+    assert store.get_state(sid) == "completed"
+
+    class BoomLLM:
+        def chat(self, messages, tools=None, on_delta=None, on_reasoning=None):
+            raise RuntimeError("api down")
+
+    ctx2 = SessionContext(session_id=sid, store=store, llm=BoomLLM())
+    with pytest.raises(RuntimeError):
+        run_turn("炸了", ctx2)
+    assert ctx2.state is AgentState.FAILED
+    assert store.get_state(sid) == "failed"
     store.close()
