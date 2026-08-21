@@ -28,7 +28,7 @@ from urllib.parse import unquote, urlparse
 
 from vgent.agent import SessionContext, run_turn
 from vgent.config import Config
-from vgent.context import COMPACT_PROMPT, ContextEngine, extract_summary
+from vgent.context import COMPACT_PROMPT, ContextEngine, extract_summary_with_fallback
 from vgent.llm import ChatResult, LLMClient
 from vgent.mcp import load_into_registry
 from vgent.memory.episodic import EpisodicMemory, summarize
@@ -192,10 +192,10 @@ class HubManager:
         self._lock = threading.Lock()
 
     def _summarizer(self, middle: list[Message]) -> str:
-        """Summarize 策略的 LLM 摘要器（/compact 用，与 cli 同口径；P4 结构化模板）。"""
+        """Summarize 策略的 LLM 摘要器（/compact 用，与 cli 同口径；P4 思考流回退提取）。"""
         prompt = Message("system", COMPACT_PROMPT)
         result = self.llm.chat([prompt, *middle])
-        return extract_summary(result.messages[0].content or "")
+        return extract_summary_with_fallback(result.messages[0])
 
     def hub(self, sid: str) -> SessionHub:
         with self._lock:
@@ -264,6 +264,9 @@ def _cmd_allow(hub: SessionHub, name: str) -> str:
             return "当前持久化 allow：" + ", ".join(ctx.permissions.rules.allow)
         return "用法：/allow <工具名>（本会话 sticky + 写入 config.toml 跨会话记住）"
     ctx.permissions.approve_sticky(name)
+    # UX 修复：同步更新内存规则（否则 /allow 无参列表只显示启动快照）
+    if name not in ctx.permissions.rules.allow:
+        ctx.permissions.rules.allow.append(name)
     persisted = False
     if ctx.data_dir is not None:
         persisted = persist_allow(ctx.data_dir, name)

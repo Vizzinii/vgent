@@ -203,3 +203,40 @@ def test_extract_summary_blocks() -> None:
     assert extract_summary("<analysis>只有草稿</analysis>") == "<analysis>只有草稿</analysis>"
     assert extract_summary("无块原文") == "无块原文"
     assert extract_summary("") == ""
+
+
+# -- P4 修复：压缩摘要提取（思考流回退 + 过短判失败） ------------------------------
+
+
+def test_extract_summary_with_fallback_prefers_content_summary() -> None:
+    """正文含 <summary> → 取正文（即使思考流更长）。"""
+    from vgent.context import extract_summary_with_fallback
+
+    msg = Message(
+        "assistant",
+        "<analysis>草稿</analysis>\n<summary>正文摘要：完成迁移，端口 8477，SQLite 保留全量</summary>",
+        reasoning_content="思考流里更长的内容",
+    )
+    assert extract_summary_with_fallback(msg) == "正文摘要：完成迁移，端口 8477，SQLite 保留全量"
+
+
+def test_extract_summary_with_fallback_uses_reasoning_when_content_fragment() -> None:
+    """bug 复现：正文无 <summary> 只有碎片 → 退回思考流取完整摘要（真机：content 35 字符 vs reasoning 528）。"""
+    from vgent.context import extract_summary_with_fallback
+
+    msg = Message(
+        "assistant",
+        "好的，我再试一次。",  # 碎片正文
+        reasoning_content="<summary>关键事实：端口 8477、SQLite 双表、会话可恢复；未完成：压缩后验证</summary>",
+    )
+    assert extract_summary_with_fallback(msg) == (
+        "关键事实：端口 8477、SQLite 双表、会话可恢复；未完成：压缩后验证"
+    )
+
+
+def test_extract_summary_with_fallback_rejects_short() -> None:
+    """正文与思考流都过短 → 判失败返回 ""（调用方退回 TailWindow 标记，不落坏摘要）。"""
+    from vgent.context import extract_summary_with_fallback
+
+    assert extract_summary_with_fallback(Message("assistant", "好的，我再试一次。", "嗯")) == ""
+    assert extract_summary_with_fallback(Message("assistant", "")) == ""

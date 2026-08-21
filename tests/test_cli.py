@@ -442,7 +442,35 @@ def test_allow_inline_sticky_and_persist(tmp_path) -> None:
     )
     _allow_inline(ctx, Console(), "shell")
     assert ctx.permissions.check(ToolSchema("shell", "d", {"type": "object"}, "exec"), {}) is Approval.AUTO
+    assert "shell" in ctx.permissions.rules.allow  # UX 修复：内存规则同步
     data = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
     assert data["permissions"]["allow"] == ["shell"]
     _allow_inline(ctx, Console(), "")  # 无参数：用法提示，不崩溃
+    store.close()
+
+
+def test_dispatch_resume_with_arg(tmp_path) -> None:
+    """UX 修复：REPL 里 /resume last|N|id 切会话（对齐 CLI --resume），不落给 LLM。"""
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _dispatch_command
+
+    store = _store(tmp_path)
+    s1 = store.create_session(title="first")
+    s2 = store.create_session(title="second")
+    path = _last_session_path(Config(data_dir=tmp_path))
+    _remember_session(path, s1)
+    ctx = SessionContext(
+        session_id=s2, store=store, llm=SimpleNamespace(chat=lambda *a, **k: None)
+    )
+    # /resume last → 上次会话 s1
+    assert _dispatch_command("/resume last", ctx, Console(), lambda p: "", path, {"n": 0}) is True
+    assert ctx.session_id == s1
+    # /resume 编号：1 = 最近一个（s2）
+    assert _dispatch_command("/resume 1", ctx, Console(), lambda p: "", path, {"n": 0}) is True
+    assert ctx.session_id == s2
+    # 无效参数：提示且不切换
+    assert _dispatch_command("/resume nope", ctx, Console(), lambda p: "", path, {"n": 0}) is True
+    assert ctx.session_id == s2
     store.close()

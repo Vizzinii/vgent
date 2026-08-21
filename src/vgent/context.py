@@ -48,6 +48,26 @@ def extract_summary(text: str) -> str:
         return m.group(1).strip()
     return text
 
+
+# 摘要最短长度：短于此判失败（与 episodic.summarize 同口径）；调用方退回 TailWindow 标记
+_MIN_SUMMARY_CHARS = 20
+
+
+def extract_summary_with_fallback(msg: Message) -> str:
+    """压缩摘要提取（P4 修复，与 episodic.summarize 三道兜底对齐）。
+
+    deepseek 思考模式会随机把完整 <summary> 放 reasoning_content、正文只回显碎片
+    （真机复现：content=35 字符碎片 vs reasoning=528 字符含全部事实）——
+    正文无 <summary> 时退回思考流；提取后仍过短判失败返回 ""（不落坏摘要）。
+    """
+    text = (msg.content or "").strip()
+    if "<summary>" not in text and msg.reasoning_content:
+        text = (msg.reasoning_content or "").strip()
+    text = extract_summary(text)
+    if len(text) < _MIN_SUMMARY_CHARS:
+        return ""
+    return text
+
 # 工具结果摘要：首行截断上限
 _PRUNE_SUMMARY_CAP = 200
 # 低水位剪枝保护的最新消息条数（hermes protect_last_n 思路）

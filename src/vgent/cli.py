@@ -25,7 +25,11 @@ from vgent import __version__
 from vgent.agent import SessionContext, run_turn
 from vgent.commands import load_commands
 from vgent.config import Config, load_config
-from vgent.context import COMPACT_PROMPT, ContextEngine, extract_summary
+from vgent.context import (
+    COMPACT_PROMPT,
+    ContextEngine,
+    extract_summary_with_fallback,
+)
 from vgent.llm import LLMClient
 from vgent.mcp import load_into_registry
 from vgent.memory.episodic import EpisodicMemory, summarize
@@ -292,12 +296,12 @@ def _resolve_resume(store: SessionStore, arg: str, last_path: Path) -> str | Non
 
 
 def _make_summarizer(llm: LLMClient) -> Callable[[list[Message]], str]:
-    """Summarize 策略的 LLM 摘要器（/compact 用；P4 结构化模板 + <summary> 提取）。"""
+    """Summarize 策略的 LLM 摘要器（/compact 用；P4 结构化模板 + 思考流回退提取）。"""
 
     def summarize(middle: list[Message]) -> str:
         prompt = Message("system", COMPACT_PROMPT)
         result = llm.chat([prompt, *middle])
-        return extract_summary(result.messages[0].content or "")
+        return extract_summary_with_fallback(result.messages[0])
 
     return summarize
 
@@ -512,6 +516,11 @@ def _dispatch_command(
             ctx.engine.compacted = None
             tokens["n"] = 0
         return True
+    if text.startswith("/resume "):  # /resume last|N|id（对齐 CLI --resume）
+        _resume_arg(ctx, console, last_path, text[len("/resume ") :].strip())
+        ctx.engine.compacted = None
+        tokens["n"] = 0
+        return True
     if text in ("/delete", "/delete-session"):
         _delete_inline(ctx, console, prompt)
         return True
@@ -641,6 +650,17 @@ def _resume_inline(
             console.print(f"[dim]已切换到会话 {ctx.session_id[:8]}[/dim]")
 
 
+def _resume_arg(ctx: SessionContext, console: Console, last_path: Path, arg: str) -> None:
+    """UX 修复：REPL 里 /resume <arg>——last / 编号 / 会话 id（对齐 CLI --resume）。"""
+    sid = _resolve_resume(ctx.store, arg, last_path)
+    if sid is None:
+        console.print("[red]没有可恢复的会话（/resume）。[/red]")
+        return
+    ctx.session_id = sid
+    _remember_session(last_path, sid)
+    console.print(f"[dim]已切换到会话 {sid[:8]}[/dim]")
+
+
 def _delete_inline(
     ctx: SessionContext, console: Console, prompt: Callable[[str], str]
 ) -> None:
@@ -714,6 +734,9 @@ def _allow_inline(ctx: SessionContext, console: Console, name: str) -> None:
             )
         return
     ctx.permissions.approve_sticky(name)
+    # UX 修复：同步更新内存规则（否则 /allow 无参列表只显示启动快照）
+    if name not in ctx.permissions.rules.allow:
+        ctx.permissions.rules.allow.append(name)
     persisted = False
     if ctx.data_dir is not None:
         persisted = persist_allow(ctx.data_dir, name)

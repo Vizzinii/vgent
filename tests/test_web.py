@@ -361,6 +361,8 @@ def test_deny_pruning_and_allow_command(tmp_path) -> None:
         assert code == 200 and "read_file" in resp["text"]  # 列出当前持久化 allow
         code, resp = s.post(f"/api/sessions/{sid}/command", {"command": "/allow write_file"})
         assert code == 200 and "已放行" in resp["text"]
+        # UX 修复：内存规则同步（/allow 无参列表能立即看到）
+        assert "write_file" in m.hub(sid).ctx.permissions.rules.allow
         data = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
         assert data["permissions"]["allow"] == ["write_file"]
     finally:
