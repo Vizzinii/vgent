@@ -191,3 +191,15 @@ def test_compress_force_bypasses_threshold() -> None:
     out = engine.compress(msgs, strategy="tail", force=True)
     assert len(out) < len(msgs)
     assert out[0] is msgs[0] and out[-1] is msgs[-1]
+
+
+# -- P4：extract_summary ------------------------------------------------------
+
+
+def test_extract_summary_blocks() -> None:
+    from vgent.context import extract_summary
+
+    assert extract_summary("<analysis>草稿</analysis>\n<summary>要点</summary>") == "要点"
+    assert extract_summary("<analysis>只有草稿</analysis>") == "<analysis>只有草稿</analysis>"
+    assert extract_summary("无块原文") == "无块原文"
+    assert extract_summary("") == ""

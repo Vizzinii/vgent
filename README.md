@@ -5,7 +5,7 @@
 **Highlights**
 
 - Dual interface: interactive REPL **and** a local Web UI (`vgent --serve`, zero extra dependencies)
-- Native tool calling: `shell` / `read_file` / `write_file` / `search`
+- Native tool calling: `shell` / `read_file` / `write_file` / `edit_file` / `search`
 - 3-tier permissions (auto-approve / confirm / reject) with per-session sticky
 - 1M-token context management: free pruning + threshold-triggered compaction (TailWindow / LLM summarization)
 - Task planning + agent state machine, failure reflection loop, episodic cross-session memory
@@ -40,7 +40,7 @@ For the full documentation (Chinese), see below.
 ## 特性
 
 - **双界面**：交互式 REPL（prompt_toolkit + rich）与本地 Web UI（`vgent --serve`，stdlib 实现、零新增依赖）共用同一套会话存储。
-- **原生 tool calling**：JSON Schema 定义工具，模型直接返回结构化 tool_calls；内置 `shell` / `read_file` / `write_file` / `search`。
+- **原生 tool calling**：JSON Schema 定义工具，模型直接返回结构化 tool_calls；内置 `shell` / `read_file` / `write_file` / `edit_file` / `search`。
 - **三档权限**：读类自动放行、写/执行类确认、未知档拒绝；确认支持「y 一次 / a 本会话总是（sticky）/ n 拒绝」。
 - **上下文管理**：1M 窗口内低水位免费剪枝（工具结果摘要、清孤儿 tool 对）+ 高水位触发压缩（TailWindow 零成本 / Summarize LLM 摘要，/compact 手动触发）；SQLite 保留全量历史，压缩只影响发送列表。
 - **任务计划 + 状态机**：多步任务模型自动输出计划块，步骤状态随执行更新并持久化（/plan 查看）。
@@ -127,6 +127,7 @@ REPL 命令：
 |---|---|---|
 | `shell` | exec | 执行 shell 命令（Windows 上为 Git Bash；需确认） |
 | `write_file` | write | 写入/追加文件（自动建目录；需确认） |
+| `edit_file` | write | 手术式编辑：精确字符串匹配替换（唯一匹配、replace_all、多义/未找到报错回喂；需确认） |
 | `read_file` | read | 读取文件（UTF-8，带行号；自动放行） |
 | `search` | read | 递归正则搜索（自动跳过 .git/node_modules 等；自动放行） |
 
@@ -173,7 +174,7 @@ permission = "exec"            # 该 server 工具默认权限档：read | write
 
 ## 已知限制与不足
 
-- **工具面**：内置工具仅 `shell` / `read_file` / `write_file` / `search`；web fetch、浏览器控制未实现（v1 决策范围）。MCP 仅 stdio 客户端，每次调用重建连接（无常驻连接），streamable HTTP/SSE 传输未做。
+- **工具面**：内置工具仅 `shell` / `read_file` / `write_file` / `edit_file` / `search`；web fetch、浏览器控制未实现（v1 决策范围）。MCP 仅 stdio 客户端，每次调用重建连接（无常驻连接），streamable HTTP/SSE 传输未做。
 - **上下文与记忆**：记忆检索是关键词子串匹配（无分词、无向量语义检索），需提到完整主题词才命中；自动摘要默认关闭（`memory_auto=false`）；`/exit` 不自动存记忆（显式 `/remember` 或任务计划完成才存）。
 - **任务计划与反思**：计划生成依赖模型配合（best-effort，模型不配合则无计划）；反思失败判定为启发式，可能漏判/误判（保守偏向不触发）。
 - **Web UI**：单用户 localhost 无鉴权，仅限本机使用；同一会话串行（转圈时禁输入）；外部命令（`~/.vgent/commands`）仅在 REPL 可用；浏览器侧以原生样式替代 rich 渲染。

@@ -115,3 +115,43 @@ def test_summarize_rejects_short_fragment() -> None:
             )
 
     assert summarize([Message("user", "hi")], JunkLLM(), "x") == ""
+
+
+def test_summarize_strips_analysis_block() -> None:
+    """P4：模型输出 <analysis>+<summary> 结构化 → 只存 <summary>（草稿不进记忆）。"""
+
+    class StructuredLLM:
+        def chat(self, messages, tools=None, on_delta=None, on_reasoning=None):
+            return SimpleNamespace(
+                messages=[
+                    Message(
+                        "assistant",
+                        "<analysis>内部草稿，不进记忆</analysis>\n"
+                        "<summary>扫描了 3 个文件，结论是升级依赖，遗留：测试未跑</summary>",
+                    )
+                ]
+            )
+
+    assert summarize([Message("user", "hi")], StructuredLLM(), "x") == (
+        "扫描了 3 个文件，结论是升级依赖，遗留：测试未跑"
+    )
+
+
+def test_summarize_prefers_summary_over_reasoning() -> None:
+    """P4：正文含 <summary> 时优先取正文（即使思考流更长/更完整）。"""
+
+    class BothLLM:
+        def chat(self, messages, tools=None, on_delta=None, on_reasoning=None):
+            return SimpleNamespace(
+                messages=[
+                    Message(
+                        "assistant",
+                        "<summary>正文里的结构化摘要：扫描了三个文件，结论是升级依赖</summary>",
+                        reasoning_content="思考流里的更长的内容，但正文已有结构化摘要",
+                    )
+                ]
+            )
+
+    assert summarize([Message("user", "hi")], BothLLM(), "x") == (
+        "正文里的结构化摘要：扫描了三个文件，结论是升级依赖"
+    )

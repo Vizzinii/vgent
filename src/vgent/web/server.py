@@ -28,7 +28,7 @@ from urllib.parse import unquote, urlparse
 
 from vgent.agent import SessionContext, run_turn
 from vgent.config import Config
-from vgent.context import ContextEngine
+from vgent.context import COMPACT_PROMPT, ContextEngine, extract_summary
 from vgent.llm import ChatResult, LLMClient
 from vgent.mcp import load_into_registry
 from vgent.memory.episodic import EpisodicMemory, summarize
@@ -37,7 +37,7 @@ from vgent.permission import ConfirmResult, PermissionSystem
 from vgent.store import SessionStore
 from vgent.task import plan_from_messages
 from vgent.tools import ToolRegistry, default_tools
-from vgent.workspace import find_instructions
+from vgent.workspace import find_instructions, find_user_instructions
 
 DEFAULT_PORT = 8477
 CONFIRM_TIMEOUT = 600.0  # 确认弹窗最长等待（秒）；超时按拒绝处理（防挂死 turn）
@@ -184,18 +184,16 @@ class HubManager:
         found = find_instructions(os.getcwd())
         self.instructions = found[1] if found else None
         self.instructions_name = found[0] if found else None
+        found_user = find_user_instructions(cfg.data_dir)  # P6：用户级指令
+        self.user_instructions = found_user[1] if found_user else None
         self._hubs: dict[str, SessionHub] = {}
         self._lock = threading.Lock()
 
     def _summarizer(self, middle: list[Message]) -> str:
-        """Summarize 策略的 LLM 摘要器（/compact 用，与 cli 同口径）。"""
-        prompt = Message(
-            "system",
-            "你是会话压缩器。把下面的对话历史压缩成 3~5 句要点摘要，"
-            "保留关键事实、已做的决定和未完成的任务；只输出摘要本身。",
-        )
+        """Summarize 策略的 LLM 摘要器（/compact 用，与 cli 同口径；P4 结构化模板）。"""
+        prompt = Message("system", COMPACT_PROMPT)
         result = self.llm.chat([prompt, *middle])
-        return (result.messages[0].content or "").strip()
+        return extract_summary(result.messages[0].content or "")
 
     def hub(self, sid: str) -> SessionHub:
         with self._lock:
@@ -215,6 +213,7 @@ class HubManager:
                     mcp_tools=self.mcp_loaded,
                     instructions=self.instructions,
                     instructions_name=self.instructions_name,
+                    user_instructions=self.user_instructions,  # P6
                 )
                 hub = SessionHub(ctx)
                 ctx.permissions = PermissionSystem(confirm=hub.confirm)

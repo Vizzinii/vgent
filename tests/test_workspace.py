@@ -1,7 +1,7 @@
-"""M10 测试：工作区指令（AGENTS.md / CLAUDE.md）发现。"""
+"""M10/P6 测试：工作区指令（AGENTS.md / CLAUDE.md）发现 + 用户级指令。"""
 from __future__ import annotations
 
-from vgent.workspace import find_instructions
+from vgent.workspace import find_instructions, find_user_instructions
 
 
 def test_find_agents_in_cwd(tmp_path) -> None:
@@ -49,3 +49,26 @@ def test_oversize_truncated(tmp_path) -> None:
     assert content.startswith("x" * 8_000)  # 正文截断到上限
     assert "已截断" in content
     assert len(content) < 20_000
+
+
+# -- P6：用户级全局指令 ---------------------------------------------------------
+
+
+def test_find_user_instructions(tmp_path) -> None:
+    (tmp_path / "AGENTS.md").write_text("用户级指令", encoding="utf-8")
+    name, content = find_user_instructions(tmp_path)
+    assert name == "AGENTS.md"
+    assert content == "用户级指令"
+
+
+def test_find_user_claude_fallback_and_missing(tmp_path) -> None:
+    assert find_user_instructions(tmp_path) is None
+    (tmp_path / "CLAUDE.md").write_text("c", encoding="utf-8")
+    name, content = find_user_instructions(tmp_path)
+    assert name == "CLAUDE.md"
+    assert content == "c"
+
+
+def test_find_user_empty_skipped(tmp_path) -> None:
+    (tmp_path / "AGENTS.md").write_text("   ", encoding="utf-8")
+    assert find_user_instructions(tmp_path) is None

@@ -33,3 +33,25 @@ def find_instructions(cwd: Path | str) -> tuple[str, str] | None:
             break
         p = p.parent
     return None
+
+
+def find_user_instructions(data_dir: Path | str) -> tuple[str, str] | None:
+    """P6：用户级全局指令（~/.vgent/AGENTS.md，CLAUDE.md 兜底），跨项目生效。
+
+    与项目级指令（find_instructions）分开：数据目录是本机 ~/.vgent（决策 7），
+    不随工作区走；注入顺序 user 在前、project 在后（见 agent.py）。
+    """
+    p = Path(data_dir)
+    for name in _INSTRUCTION_FILES:
+        f = p / name
+        if f.is_file():
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if not text:
+                continue
+            if len(text) > _INSTRUCTIONS_CAP:
+                text = text[:_INSTRUCTIONS_CAP] + "…（指令文件过长，已截断）"
+            return name, text
+    return None

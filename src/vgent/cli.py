@@ -25,7 +25,7 @@ from vgent import __version__
 from vgent.agent import SessionContext, run_turn
 from vgent.commands import load_commands
 from vgent.config import Config, load_config
-from vgent.context import ContextEngine
+from vgent.context import COMPACT_PROMPT, ContextEngine, extract_summary
 from vgent.llm import LLMClient
 from vgent.mcp import load_into_registry
 from vgent.memory.episodic import EpisodicMemory, summarize
@@ -35,7 +35,7 @@ from vgent.reflection import reflect
 from vgent.store import SessionStore
 from vgent.task import plan_from_messages
 from vgent.tools import ToolSchema, default_tools
-from vgent.workspace import find_instructions
+from vgent.workspace import find_instructions, find_user_instructions
 
 HELP = """命令：
   /new            新建会话
@@ -283,16 +283,12 @@ def _resolve_resume(store: SessionStore, arg: str, last_path: Path) -> str | Non
 
 
 def _make_summarizer(llm: LLMClient) -> Callable[[list[Message]], str]:
-    """Summarize 策略的 LLM 摘要器：把中间段历史压成几句要点（/compact 用）。"""
+    """Summarize 策略的 LLM 摘要器（/compact 用；P4 结构化模板 + <summary> 提取）。"""
 
     def summarize(middle: list[Message]) -> str:
-        prompt = Message(
-            "system",
-            "你是会话压缩器。把下面的对话历史压缩成 3~5 句要点摘要，"
-            "保留关键事实、已做的决定和未完成的任务；只输出摘要本身。",
-        )
+        prompt = Message("system", COMPACT_PROMPT)
         result = llm.chat([prompt, *middle])
-        return (result.messages[0].content or "").strip()
+        return extract_summary(result.messages[0].content or "")
 
     return summarize
 
@@ -387,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
         engine = ContextEngine(cfg.provider.context_length, cfg.context)
         engine.summarizer = _make_summarizer(llm)  # M4：/compact 的 LLM 摘要器
         ext_commands = load_commands(cfg.data_dir / "commands")  # M10：外部命令
+        found_user = find_user_instructions(cfg.data_dir)  # P6：用户级指令（~/.vgent/AGENTS.md）
         found = find_instructions(os.getcwd())  # M10：项目指令（AGENTS.md/CLAUDE.md）
         ctx = SessionContext(
             session_id=session_id,
@@ -401,10 +398,15 @@ def main(argv: list[str] | None = None) -> int:
             mcp_tools=mcp_loaded,  # M9
             instructions=found[1] if found else None,  # M10
             instructions_name=found[0] if found else None,  # M10
+            user_instructions=found_user[1] if found_user else None,  # P6
             ext_commands=ext_commands,  # M10
         )
         if ext_commands:
             console.print(f"[dim]外部命令：{', '.join(sorted(ext_commands))}[/dim]")
+        if found_user:
+            console.print(
+                f"[dim]已加载用户指令 {found_user[0]}（{len(found_user[1])} 字符）[/dim]"
+            )
         if found:
             console.print(f"[dim]已加载项目指令 {found[0]}（{len(found[1])} 字符）[/dim]")
         # M10：REPL prompter = 内置 + 外部命令补全 + 常驻状态栏

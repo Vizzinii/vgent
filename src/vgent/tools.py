@@ -268,6 +268,50 @@ def _write_file_handler(args: dict) -> str:
     return f"已{mode} {len(content)} 字符 → {path}"
 
 
+def _edit_file_handler(args: dict) -> str:
+    """P1：手术式编辑——精确字符串替换（claude FileEditTool 简化版，决策 9 防御式）。
+
+    - old_string 必须唯一匹配（replace_all=false），多义时报错回喂模型要求更多上下文；
+    - old_string == new_string 拒绝（空操作）；
+    - 未找到 / 读取失败时不写文件，错误文本回喂模型自纠正。
+    """
+    raw = str(args.get("path", "")).strip()
+    if not raw:
+        return "错误：缺少 path 参数"
+    old = str(args.get("old_string", ""))
+    new = str(args.get("new_string", ""))
+    if not old:
+        return "错误：缺少 old_string 参数"
+    if old == new:
+        return "错误：old_string 与 new_string 相同（空操作），请检查替换目标"
+    ra = args.get("replace_all", False)
+    if isinstance(ra, str):
+        replace_all = ra.strip().lower() in ("1", "true", "yes")
+    else:
+        replace_all = bool(ra)
+    path = Path(raw)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"读取失败：{exc}"
+    count = text.count(old)
+    if count == 0:
+        return (
+            f"错误：文件中未找到要替换的文本（{len(old)} 字符）。"
+            "请确认 old_string 精确匹配当前文件内容"
+        )
+    if count > 1 and not replace_all:
+        return (
+            f"错误：old_string 在文件中出现 {count} 次，替换目标不明确。"
+            "请提供更多上下文使 old_string 唯一匹配，或设置 replace_all=true"
+        )
+    try:
+        path.write_text(text.replace(old, new), encoding="utf-8")
+    except OSError as exc:
+        return f"写入失败：{exc}"
+    return f"已替换 {count} 处 → {path}"
+
+
 def default_tools() -> ToolRegistry:
     """M5 内置工具：shell（exec 档）+ read_file / search（read 档）+ write_file（write 档）。"""
     reg = ToolRegistry()
@@ -348,5 +392,30 @@ def default_tools() -> ToolRegistry:
             permission="write",
         ),
         _write_file_handler,
+    )
+    reg.register(
+        ToolSchema(
+            name="edit_file",
+            description=(
+                "手术式编辑文件（P1）：精确字符串匹配替换，适合局部修改大文件、避免整文件重写。"
+                "old_string 必须唯一匹配（出现多次时报错，需更多上下文或 replace_all=true）；"
+                "old_string 与 new_string 相同会被拒绝；未找到会报错且不写文件。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径（相对或绝对）"},
+                    "old_string": {"type": "string", "description": "要替换的精确原文（需唯一匹配）"},
+                    "new_string": {"type": "string", "description": "替换后的内容"},
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "替换所有匹配（默认 false）",
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+            permission="write",
+        ),
+        _edit_file_handler,
     )
     return reg

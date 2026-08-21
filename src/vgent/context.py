@@ -20,11 +20,33 @@ r"""⑤ 上下文引擎 —— ContextEngine（M3，决策 8 综合方案）。
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from vgent.config import ContextConfig
 from vgent.messages import Message, Usage
+
+# P4（claude BASE_COMPACT_PROMPT 简化版）：压缩/记忆摘要的结构化模板
+COMPACT_PROMPT = (
+    "你是会话压缩器。把下面的对话历史压缩成详细摘要，供后续对话继续使用。\n"
+    "先输出 <analysis> 块组织你的思考（草稿，不进入最终上下文），"
+    "再输出 <summary> 块作为最终摘要。\n"
+    "摘要必须覆盖：\n"
+    "1. 未完成的任务与下一步计划；\n"
+    "2. 已做出的关键决策与采用的技术方案；\n"
+    "3. 关键事实（文件路径、命令、数据、代码模式）；\n"
+    "4. 用户明确的安全约束或偏好（如涉及，原样保留，不得改写）。\n"
+    "只输出 <analysis> 和 <summary> 两个块。"
+)
+
+
+def extract_summary(text: str) -> str:
+    """从结构化压缩输出里取 <summary> 块（analysis 是草稿不进上下文）；无块则原文。"""
+    m = re.search(r"<summary>(.*?)</summary>", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return text
 
 # 工具结果摘要：首行截断上限
 _PRUNE_SUMMARY_CAP = 200

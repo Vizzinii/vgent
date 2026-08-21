@@ -728,3 +728,47 @@ def test_no_instructions_no_inject(tmp_path) -> None:
     run_turn("任务", ctx)
     assert not any(m.role == "system" and "项目指令" in m.content for m in llm.calls[0])
     store.close()
+
+
+# -- P6：用户级指令（~/.vgent/AGENTS.md）注入 ------------------------------------
+
+
+def test_user_instructions_injected_before_project(tmp_path) -> None:
+    """P6：用户级指令首轮注入（不落库），顺序在项目指令之前。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    llm = ScriptedLLM([_chat_final("收到")])
+    ctx = SessionContext(
+        session_id=sid,
+        store=store,
+        llm=llm,
+        user_instructions="不要删除任何文件",
+        instructions="项目规则",
+        instructions_name="AGENTS.md",
+    )
+    run_turn("任务", ctx)
+    send = llm.calls[0]
+    user = next(
+        (i for i, m in enumerate(send) if m.content.startswith("用户指令")), None
+    )
+    proj = next(
+        (i for i, m in enumerate(send) if m.content.startswith("项目指令")), None
+    )
+    assert user is not None and proj is not None
+    assert user < proj  # 用户级在前
+    assert "不要删除任何文件" in send[user].content
+    # 不落库：历史只有 user + assistant
+    assert [m.role for m in store.get_history(sid)] == ["user", "assistant"]
+
+
+def test_user_instructions_not_injected_second_turn(tmp_path) -> None:
+    """P6：用户级指令只在首轮注入。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    llm = ScriptedLLM([_chat_final("收到"), _chat_final("继续")])
+    ctx = SessionContext(
+        session_id=sid, store=store, llm=llm, user_instructions="用户偏好：简洁回答"
+    )
+    run_turn("任务一", ctx)
+    run_turn("任务二", ctx)
+    assert not any(m.content.startswith("用户指令") for m in llm.calls[1])

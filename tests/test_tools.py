@@ -26,6 +26,7 @@ def test_default_tools_registered() -> None:
         "read_file",
         "write_file",
         "search",
+        "edit_file",  # P1
     }
 
 
@@ -139,6 +140,70 @@ def test_search_single_file(tmp_path) -> None:
     p.write_text("target line\n", encoding="utf-8")
     out = reg.execute("search", {"pattern": "target", "path": str(p)})
     assert "only.txt:1: target line" in out
+
+
+# -- P1：edit_file 手术式编辑 ---------------------------------------------------
+
+
+def test_edit_file_basic_replace(tmp_path) -> None:
+    p = tmp_path / "a.txt"
+    p.write_text("hello vgent\nworld\n", encoding="utf-8")
+    reg = default_tools()
+    out = reg.execute(
+        "edit_file", {"path": str(p), "old_string": "vgent", "new_string": "vgent2"}
+    )
+    assert "已替换 1 处" in out
+    assert p.read_text(encoding="utf-8") == "hello vgent2\nworld\n"
+
+
+def test_edit_file_replace_all(tmp_path) -> None:
+    p = tmp_path / "a.txt"
+    p.write_text("vgent vgent\n", encoding="utf-8")
+    reg = default_tools()
+    reg.execute(
+        "edit_file",
+        {"path": str(p), "old_string": "vgent", "new_string": "v2", "replace_all": True},
+    )
+    assert p.read_text(encoding="utf-8") == "v2 v2\n"
+
+
+def test_edit_file_ambiguous_without_replace_all(tmp_path) -> None:
+    """P1 防御式：old_string 出现多次且未开 replace_all → 报错回喂，文件不动。"""
+    p = tmp_path / "a.txt"
+    p.write_text("vgent and vgent\n", encoding="utf-8")
+    reg = default_tools()
+    out = reg.execute("edit_file", {"path": str(p), "old_string": "vgent", "new_string": "x"})
+    assert "2 次" in out and "不明确" in out
+    assert p.read_text(encoding="utf-8") == "vgent and vgent\n"
+
+
+def test_edit_file_not_found_keeps_file(tmp_path) -> None:
+    p = tmp_path / "a.txt"
+    p.write_text("original\n", encoding="utf-8")
+    reg = default_tools()
+    out = reg.execute("edit_file", {"path": str(p), "old_string": "nope", "new_string": "x"})
+    assert "未找到" in out
+    assert p.read_text(encoding="utf-8") == "original\n"
+
+
+def test_edit_file_same_old_new_rejected(tmp_path) -> None:
+    p = tmp_path / "a.txt"
+    p.write_text("abc\n", encoding="utf-8")
+    reg = default_tools()
+    out = reg.execute("edit_file", {"path": str(p), "old_string": "abc", "new_string": "abc"})
+    assert "相同" in out
+    assert p.read_text(encoding="utf-8") == "abc\n"
+
+
+def test_edit_file_missing_args() -> None:
+    reg = default_tools()
+    assert "缺少 path" in reg.execute("edit_file", {"old_string": "a", "new_string": "b"})
+    assert "缺少 old_string" in reg.execute(
+        "edit_file", {"path": "x.txt", "new_string": "b"}
+    )
+    assert "读取失败" in reg.execute(
+        "edit_file", {"path": "C:/no/such/vgent.txt", "old_string": "a", "new_string": "b"}
+    )
 
 
 # -- shell 解析兜底（真机首跑修复：Git 装在非标准路径） -------------------------

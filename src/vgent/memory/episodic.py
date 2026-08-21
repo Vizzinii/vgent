@@ -14,13 +14,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from vgent.context import extract_summary
 from vgent.messages import Message
 
 SUMMARIZE_PROMPT = (
-    "你是会话记忆整理器。把下面的对话压缩成任务摘要，要求：\n"
-    "1. 用要点句输出 3~5 句，覆盖：做了什么、关键结论、遗留事项；\n"
-    "2. 用自己的话概括，绝对不要引用或复述对话中的原句；\n"
-    "3. 只输出摘要本身，不要任何前缀或解释。"
+    "你是会话记忆整理器。把下面的对话压缩成任务摘要：\n"
+    "先输出 <analysis> 块组织你的思考（草稿，不写入记忆），"
+    "再输出 <summary> 块作为最终摘要。\n"
+    "摘要必须覆盖：\n"
+    "1. 做了什么（关键操作与工具调用结果）；\n"
+    "2. 关键结论与技术决策；\n"
+    "3. 未完成的任务与遗留事项；\n"
+    "4. 用户明确的安全约束或偏好（如涉及，原样保留，不得改写）。\n"
+    "用自己的话概括，绝对不要引用或复述对话中的原句；"
+    "只输出 <analysis> 和 <summary> 两个块，不要其他内容。"
 )
 
 _TAIL_WINDOW = 30  # 摘要只看最近 N 条（够用，省 token）
@@ -111,8 +118,10 @@ def summarize(msgs: list[Message], llm: Callable, topic: str) -> str:
         return ""
     msg = result.messages[0]
     text = (msg.content or "").strip()
-    if len(text) < _MIN_SUMMARY_CHARS:
+    # P4：结构化输出时优先取含 <summary> 的那份（正文无 summary 则退回思考流）
+    if "<summary>" not in text and msg.reasoning_content:
         text = (msg.reasoning_content or "").strip()
+    text = extract_summary(text)  # analysis 是草稿，不进记忆
     if len(text) < _MIN_SUMMARY_CHARS:
         return ""
     return text

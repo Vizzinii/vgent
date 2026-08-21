@@ -51,6 +51,7 @@ class SessionContext:
     mcp_tools: dict[str, list[str]] = field(default_factory=dict)  # M9：已加载的 MCP 工具 {server: [names]}
     instructions: str | None = None  # M10：项目指令内容（AGENTS.md/CLAUDE.md）
     instructions_name: str | None = None  # M10：指令来源文件名（cli 解析时记录）
+    user_instructions: str | None = None  # P6：用户级指令（~/.vgent/AGENTS.md）
     ext_commands: dict[str, Callable] = field(default_factory=dict)  # M10：外部命令 {name: run(ctx, args)}
 
 
@@ -91,15 +92,20 @@ def run_turn(
     cwd_anchor: Message | None = (
         Message("system", f"工作目录：{os.getcwd()}；工具的相对路径基于此。") if first_turn else None
     )
-    # M10：项目指令（AGENTS.md/CLAUDE.md）——新会话首轮注入一次，不落库（与 cwd_anchor 同模式）
-    instructions_anchor: Message | None = (
-        Message(
-            "system",
-            f"项目指令（{ctx.instructions_name or 'AGENTS.md'}）：\n{ctx.instructions}",
+    # P6/M10：用户级（~/.vgent/AGENTS.md）+ 项目级指令——新会话首轮注入一次，不落库
+    # （与 cwd_anchor 同模式）；顺序：用户在前、项目在后
+    instruction_anchors: list[Message] = []
+    if first_turn and ctx.user_instructions:
+        instruction_anchors.append(
+            Message("system", f"用户指令（用户级）：\n{ctx.user_instructions}")
         )
-        if first_turn and ctx.instructions
-        else None
-    )
+    if first_turn and ctx.instructions:
+        instruction_anchors.append(
+            Message(
+                "system",
+                f"项目指令（{ctx.instructions_name or 'AGENTS.md'}）：\n{ctx.instructions}",
+            )
+        )
     # M8：自动回忆——用户消息命中已存记忆主题 → 注入 [记忆]（不落库，一次性）
     memory_notes: list[Message] | None = None
     if ctx.memory is not None:
@@ -122,9 +128,9 @@ def run_turn(
             if cwd_anchor is not None:  # 工作目录锚点：只注入首个 LLM 调用
                 send.insert(0, cwd_anchor)
                 cwd_anchor = None
-            if instructions_anchor is not None:  # M10：项目指令：只注入首个 LLM 调用
-                send.insert(0, instructions_anchor)
-                instructions_anchor = None
+            if instruction_anchors:  # P6/M10：指令：只注入首个 LLM 调用
+                send = instruction_anchors + send
+                instruction_anchors = []
             if hint is not None:  # M6：无计划时注入规划提示（不落库）
                 send.insert(0, hint)
             if plan_nudge is not None:  # M6：有工具执行 → 轻推同步计划状态
