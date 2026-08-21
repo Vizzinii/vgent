@@ -79,3 +79,14 @@ def test_update_title(tmp_path) -> None:
     store.update_title(sid, "帮我看看项目结构")
     assert store.get_title(sid) == "帮我看看项目结构"
     store.close()
+
+
+def test_delete_session_cleans_states(tmp_path) -> None:
+    """修复：删除会话同步清理 session_states，不留孤儿状态行。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    store.set_state(sid, "completed")
+    assert store.get_state(sid) == "completed"
+    store.delete_session(sid)
+    assert store.get_state(sid) is None
+    store.close()

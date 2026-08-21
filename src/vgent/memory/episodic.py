@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -77,6 +78,8 @@ class MemoryEntry:
 class EpisodicMemory:
     def __init__(self, path: Path) -> None:
         self.path = path
+        # 并发安全：Web 多线程下 add（写）与 _entries（读）互斥，防 JSONL 丢行/读半行
+        self._lock = threading.Lock()
 
     def add(
         self,
@@ -89,7 +92,7 @@ class EpisodicMemory:
         """追加一条记忆；project 缺省取当前 cwd 顶层目录名（P5）。"""
         entry = MemoryEntry(_now(), session_id, title, topic, summary, project or current_project())
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
+        with self._lock, self.path.open("a", encoding="utf-8") as f:  # 串行化 open+write（并发追加会丢行）
             f.write(entry.to_line() + "\n")
         return entry
 
@@ -128,10 +131,11 @@ class EpisodicMemory:
     def _entries(self) -> list[MemoryEntry]:
         if not self.path.exists():
             return []
-        try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return []
+        with self._lock:  # 与 add 互斥：读不拿到写一半的行
+            try:
+                lines = self.path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                return []
         return [e for line in lines if (e := MemoryEntry.from_line(line)) is not None]
 
 

@@ -191,3 +191,22 @@ def test_legacy_entry_without_project(tmp_path) -> None:
     hits = mem.search("旧主题")
     assert len(hits) == 1 and hits[0].project == ""
     assert mem.search("旧主题", project="proj-a") == []
+
+
+def test_concurrent_add_no_line_loss(tmp_path) -> None:
+    """并发安全修复：多线程同时 add 不丢行/不坏行（Web 多线程真实路径）。"""
+    import threading
+
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+
+    def worker(i: int) -> None:
+        for j in range(10):
+            mem.add(f"t{i}-{j}", f"s{i}-{j}", f"sid{i}-{j}", f"title{i}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert mem.count() == 80  # 无丢行（坏行会被 from_line 跳过，count 即有效行数）
+    assert len({e.topic for e in mem.search("t", limit=100)}) == 80  # 无重复/无坏行

@@ -103,6 +103,9 @@ class SessionStore:
     @_locked
     def delete_session(self, session_id: str) -> None:
         self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        self._conn.execute(
+            "DELETE FROM session_states WHERE session_id = ?", (session_id,)
+        )  # M6 状态表同步清理，避免孤儿残留
         self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         self._conn.commit()
 
