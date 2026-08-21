@@ -67,6 +67,15 @@ class ToolRegistry:
     def execute(self, name: str, args: dict) -> str:
         return self._tools[name].handler(args)
 
+    def filter_denied(self, denied: list[str]) -> None:
+        """P10：deny 规则的工具从注册表移除——schemas() 不再暴露，模型看不到。
+
+        由 cli/web 在接线时调用（内置工具 + MCP 工具一起过滤）；check() 的
+        DENIED 分支仍保留作直接 execute 的兜底。
+        """
+        for name in denied:
+            self._tools.pop(name, None)
+
 
 # -- 内置工具 -------------------------------------------------------------
 

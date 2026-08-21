@@ -30,7 +30,7 @@ from vgent.llm import LLMClient
 from vgent.mcp import load_into_registry
 from vgent.memory.episodic import EpisodicMemory, summarize
 from vgent.messages import Message
-from vgent.permission import ConfirmResult, PermissionSystem
+from vgent.permission import ConfirmResult, PermissionSystem, persist_allow
 from vgent.reflection import reflect
 from vgent.store import SessionStore
 from vgent.task import plan_from_messages
@@ -50,6 +50,7 @@ HELP = """命令：
   /memories       列出已记住的任务摘要
   /mcp            列出已加载的 MCP 工具
   /reasoning      切换思考过程展示（开/关，默认关）
+  /allow <工具>   放行工具（本会话 sticky + 写入 config.toml 跨会话记住）
   /help           显示帮助
   /exit           退出
 外部命令：~/.vgent/commands/<name>.py 定义 run(ctx, args)，用 /<name> 调用（/help 列出）
@@ -70,6 +71,7 @@ _BUILTIN_COMMANDS = (
     "/memories",
     "/mcp",
     "/reasoning",
+    "/allow",
     "/help",
     "/exit",
     "/quit",
@@ -248,6 +250,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--port", type=int, default=8477, help="--serve 的端口（默认 8477）"
     )
+    parser.add_argument(
+        "-p",
+        "--print",
+        dest="print_query",
+        metavar="TEXT",
+        help="无头跑一轮对话并输出结果后退出（脚本/CI 用；write/exec 默认拒绝，P8）",
+    )
     return parser
 
 
@@ -331,6 +340,45 @@ def _resolve_start_session(
     return picked or store.create_session()
 
 
+def _run_headless(cfg: Config, store: SessionStore, query: str, console: Console) -> int:
+    """P8：无头单次执行——`vgent --print "问题"` 建新会话跑一轮，流式输出后退出。
+
+    headless 安全默认：无确认交互（confirm=None）→ write/exec 自动拒绝；
+    P2 规则照常生效（allow 放行、deny 裁剪）。失败时输出错误并返回 1（可脚本判断）。
+    """
+    session_id = store.create_session()
+    llm = LLMClient(cfg)
+    tools = default_tools()
+    load_into_registry(tools, cfg.mcp_servers)
+    tools.filter_denied(cfg.permissions.deny)  # P10
+    engine = ContextEngine(cfg.provider.context_length, cfg.context)
+    engine.summarizer = _make_summarizer(llm)
+    found_user = find_user_instructions(cfg.data_dir)  # P6
+    found = find_instructions(os.getcwd())  # M10
+    ctx = SessionContext(
+        session_id=session_id,
+        store=store,
+        llm=llm,
+        tools=tools,
+        permissions=PermissionSystem(rules=cfg.permissions),  # P2：无交互 → 默认拒绝
+        engine=engine,
+        show_reasoning=cfg.show_reasoning,
+        memory=EpisodicMemory(cfg.data_dir / "memory" / "episodic.jsonl"),  # M8
+        memory_auto=cfg.memory_auto,
+        instructions=found[1] if found else None,
+        instructions_name=found[0] if found else None,
+        user_instructions=found_user[1] if found_user else None,
+        data_dir=cfg.data_dir,  # P2
+    )
+    try:
+        run_turn(query, ctx, on_delta=lambda d: console.print(d, end="", markup=False))
+        console.print()
+    except Exception as exc:  # noqa: BLE001 — 无头模式失败要可见且可脚本判断
+        console.print(f"[red]调用失败：{exc}[/red]")
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # 兼容 `vgent serve` 写法（argparse 无子命令，转成 --serve）
@@ -351,6 +399,8 @@ def main(argv: list[str] | None = None) -> int:
         code = _headless(store, args, console)
         if code is not None:
             return code
+        if args.print_query is not None:  # P8：无头单次执行（脚本/CI）
+            return _run_headless(cfg, store, args.print_query, console)
         if args.serve:  # M11：本地 Web UI（独立入口，CLI 保留双入口）
             store.close()
             from vgent.web.server import serve as web_serve
@@ -373,13 +423,16 @@ def main(argv: list[str] | None = None) -> int:
         llm = LLMClient(cfg)
         tools = default_tools()
         mcp_loaded = load_into_registry(tools, cfg.mcp_servers)  # M9：加载 MCP 工具
+        tools.filter_denied(cfg.permissions.deny)  # P10：deny 工具从 schemas() 裁剪
         if cfg.mcp_servers:
             for server, names in mcp_loaded.items():
                 if names:
                     console.print(f"[dim]MCP: {server}（{len(names)} 工具）[/dim]")
                 else:
                     console.print(f"[yellow]MCP: {server} 加载失败（已跳过）[/yellow]")
-        permissions = PermissionSystem(confirm=_make_confirm(console, prompt))
+        permissions = PermissionSystem(  # P2：规则表 + sticky 确认交互
+            confirm=_make_confirm(console, prompt), rules=cfg.permissions
+        )
         engine = ContextEngine(cfg.provider.context_length, cfg.context)
         engine.summarizer = _make_summarizer(llm)  # M4：/compact 的 LLM 摘要器
         ext_commands = load_commands(cfg.data_dir / "commands")  # M10：外部命令
@@ -400,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
             instructions_name=found[0] if found else None,  # M10
             user_instructions=found_user[1] if found_user else None,  # P6
             ext_commands=ext_commands,  # M10
+            data_dir=cfg.data_dir,  # P2：/allow 持久化
         )
         if ext_commands:
             console.print(f"[dim]外部命令：{', '.join(sorted(ext_commands))}[/dim]")
@@ -485,6 +539,9 @@ def _dispatch_command(
     if text == "/reasoning":
         ctx.show_reasoning = not ctx.show_reasoning
         console.print(f"[dim]思考过程展示：{'开' if ctx.show_reasoning else '关'}[/dim]")
+        return True
+    if text == "/allow" or text.startswith("/allow "):
+        _allow_inline(ctx, console, text[len("/allow ") :].strip() if text != "/allow" else "")
         return True
     # M10：外部命令（~/.vgent/commands/<name>.py 的 run(ctx, args)）；内置优先，这里兜底
     if text.startswith("/") and len(text) > 1:
@@ -642,6 +699,30 @@ def _reflect_inline(ctx: SessionContext, console: Console) -> None:
     ctx.store.add_message(ctx.session_id, Message("system", f"[反思] {note}"))
     first = note.splitlines()[0][:80] if note else ""
     console.print(f"[dim]已写入反思：{first}[/dim]")
+
+
+def _allow_inline(ctx: SessionContext, console: Console, name: str) -> None:
+    """P2：/allow —— 本会话 sticky 放行 + 写入 config.toml [permissions].allow 跨会话记住。"""
+    if not name:
+        console.print(
+            "用法：/allow <工具名>（本会话 sticky 放行，并写入 config.toml 的 "
+            "[permissions].allow 跨会话记住）"
+        )
+        if ctx.permissions.rules.allow:
+            console.print(
+                f"[dim]当前持久化 allow：{', '.join(ctx.permissions.rules.allow)}[/dim]"
+            )
+        return
+    ctx.permissions.approve_sticky(name)
+    persisted = False
+    if ctx.data_dir is not None:
+        persisted = persist_allow(ctx.data_dir, name)
+    suffix = (
+        "，已写入 config.toml（跨会话生效）"
+        if persisted
+        else "（本会话生效；config.toml 不存在或写入失败，未持久化）"
+    )
+    console.print(f"[dim]已放行 {name}{suffix}[/dim]")
 
 
 def _remember_inline(ctx: SessionContext, console: Console, topic: str) -> None:

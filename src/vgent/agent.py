@@ -12,10 +12,11 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from vgent.context import ContextEngine
 from vgent.llm import ChatResult, LLMClient
-from vgent.memory.episodic import EpisodicMemory, summarize
+from vgent.memory.episodic import EpisodicMemory, current_project, summarize
 from vgent.messages import Message, ToolCall
 from vgent.permission import Approval, ConfirmResult, PermissionSystem
 from vgent.reflection import MAX_REFLECT_ROUNDS, looks_failed, reflect
@@ -53,6 +54,7 @@ class SessionContext:
     instructions_name: str | None = None  # M10：指令来源文件名（cli 解析时记录）
     user_instructions: str | None = None  # P6：用户级指令（~/.vgent/AGENTS.md）
     ext_commands: dict[str, Callable] = field(default_factory=dict)  # M10：外部命令 {name: run(ctx, args)}
+    data_dir: Path | None = None  # P2：/allow 持久化到 config.toml 用（cli/web 注入）
 
 
 def run_turn(
@@ -107,10 +109,11 @@ def run_turn(
             )
         )
     # M8：自动回忆——用户消息命中已存记忆主题 → 注入 [记忆]（不落库，一次性）
+    # P5：只搜当前项目（防跨项目串味）
     memory_notes: list[Message] | None = None
     if ctx.memory is not None:
         hits = [
-            e for e in ctx.memory.search(user_input, limit=2)
+            e for e in ctx.memory.search(user_input, limit=2, project=current_project())
             if not _memory_already_present(msgs, e.topic)
         ]
         if hits:

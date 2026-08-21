@@ -59,3 +59,73 @@ def test_unknown_permission_denied() -> None:
     ps = PermissionSystem()
     t = ToolSchema("weird", "d", {"type": "object"}, "sudo")  # type: ignore[arg-type]
     assert ps.check(t, {}) is Approval.DENIED
+
+
+# -- P2：权限规则表（config.toml [permissions]）+ 持久化批准 --------------------
+
+
+def _named_tool(name: str, permission: str) -> ToolSchema:
+    return ToolSchema(name, "desc", {"type": "object"}, permission)  # type: ignore[arg-type]
+
+
+def test_rules_allow_overrides_confirm() -> None:
+    from vgent.config import PermissionRules
+
+    ps = PermissionSystem(rules=PermissionRules(allow=["shell"]))
+    assert ps.check(_named_tool("shell", "exec"), {}) is Approval.AUTO
+
+
+def test_rules_ask_forces_confirm_on_read() -> None:
+    from vgent.config import PermissionRules
+
+    ps = PermissionSystem(rules=PermissionRules(ask=["read_file"]))
+    assert ps.check(_named_tool("read_file", "read"), {}) is Approval.NEED_CONFIRM
+
+
+def test_rules_deny_wins_over_allow() -> None:
+    from vgent.config import PermissionRules
+
+    ps = PermissionSystem(rules=PermissionRules(allow=["shell"], deny=["shell"]))
+    assert ps.check(_named_tool("shell", "exec"), {}) is Approval.DENIED
+
+
+def test_rules_unmatched_falls_back_to_three_tier() -> None:
+    from vgent.config import PermissionRules
+
+    ps = PermissionSystem(rules=PermissionRules(ask=["other"]))
+    assert ps.check(_tool("read"), {}) is Approval.AUTO
+    assert ps.check(_tool("exec"), {}) is Approval.NEED_CONFIRM
+
+
+def test_sticky_beats_ask_rule() -> None:
+    from vgent.config import PermissionRules
+
+    ps = PermissionSystem(rules=PermissionRules(ask=["shell"]))
+    ps.approve_sticky("shell")
+    assert ps.check(_named_tool("shell", "exec"), {}) is Approval.AUTO
+
+
+def test_persist_allow_writes_and_preserves(tmp_path) -> None:
+    import tomllib
+
+    from vgent.permission import persist_allow
+
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[provider]\nactive = "deepseek"\n\n[permissions]\nask = ["read_file"]\n',
+        encoding="utf-8",
+    )
+    assert persist_allow(tmp_path, "shell") is True
+    data = tomllib.loads(p.read_text(encoding="utf-8"))
+    assert data["permissions"]["allow"] == ["shell"]
+    assert data["permissions"]["ask"] == ["read_file"]  # 同段其他键保留
+    assert data["provider"]["active"] == "deepseek"  # 其他段保留
+    # 幂等：已存在不重复
+    assert persist_allow(tmp_path, "shell") is True
+    assert tomllib.loads(p.read_text(encoding="utf-8"))["permissions"]["allow"] == ["shell"]
+
+
+def test_persist_allow_missing_config_false(tmp_path) -> None:
+    from vgent.permission import persist_allow
+
+    assert persist_allow(tmp_path, "shell") is False

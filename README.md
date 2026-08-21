@@ -6,7 +6,7 @@
 
 - Dual interface: interactive REPL **and** a local Web UI (`vgent --serve`, zero extra dependencies)
 - Native tool calling: `shell` / `read_file` / `write_file` / `edit_file` / `search`
-- 3-tier permissions (auto-approve / confirm / reject) with per-session sticky
+- 3-tier permissions (auto-approve / confirm / reject) with per-session sticky + configurable rules (`[permissions]`)
 - 1M-token context management: free pruning + threshold-triggered compaction (TailWindow / LLM summarization)
 - Task planning + agent state machine, failure reflection loop, episodic cross-session memory
 - MCP client, multi-provider config, SQLite session persistence (list / resume / delete)
@@ -41,11 +41,11 @@ For the full documentation (Chinese), see below.
 
 - **双界面**：交互式 REPL（prompt_toolkit + rich）与本地 Web UI（`vgent --serve`，stdlib 实现、零新增依赖）共用同一套会话存储。
 - **原生 tool calling**：JSON Schema 定义工具，模型直接返回结构化 tool_calls；内置 `shell` / `read_file` / `write_file` / `edit_file` / `search`。
-- **三档权限**：读类自动放行、写/执行类确认、未知档拒绝；确认支持「y 一次 / a 本会话总是（sticky）/ n 拒绝」。
+- **三档权限**：读类自动放行、写/执行类确认、未知档拒绝；确认支持「y 一次 / a 本会话总是（sticky）/ n 拒绝」；`[permissions]` 规则表可持久化（allow 放行 / ask 总是确认 / deny 拒绝且从模型可见的工具池裁剪）。
 - **上下文管理**：1M 窗口内低水位免费剪枝（工具结果摘要、清孤儿 tool 对）+ 高水位触发压缩（TailWindow 零成本 / Summarize LLM 摘要，/compact 手动触发）；SQLite 保留全量历史，压缩只影响发送列表。
 - **任务计划 + 状态机**：多步任务模型自动输出计划块，步骤状态随执行更新并持久化（/plan 查看）。
 - **失败反思循环**：工具失败后 LLM 显式反思（Failure/Action）注入下一轮引导修正（/reflect 手动触发）。
-- **跨会话记忆**：LLM 生成任务摘要存本机 JSONL（/remember /recall /memories），自动回忆注入。
+- **跨会话记忆**：LLM 生成任务摘要存本机 JSONL（/remember /recall /memories），自动回忆注入（按项目隔离，防跨项目串味）。
 - **MCP 客户端**：stdio 连本地 MCP server，工具以 `<server>_<tool>` 前缀进入工具面（/mcp 查看）。
 - **会话持久化**：SQLite 双表 + WAL，会话可列出/恢复/删除，记忆上次会话。
 - **AGENTS.md 项目指令**：启动时自动读取工作区指令注入首个调用；**外部命令**：`~/.vgent/commands/<name>.py` 定义 `/命令`。
@@ -102,6 +102,7 @@ vgent serve --port 8080  # `vgent serve` 是 --serve 的别名写法；--port �
 | `--delete-session ID` | 删除指定会话后退出 |
 | `--provider <name>` | 临时切换 provider（config.toml 的 [providers] 名） |
 | `--serve [--port N]` | 启动本地 Web UI |
+| `-p` / `--print <问题>` | 无头跑一轮对话并输出结果后退出（脚本/CI 用；write/exec 默认拒绝） |
 | `--version` | 版本 |
 
 REPL 命令：
@@ -119,6 +120,7 @@ REPL 命令：
 | `/memories` | 列出已记住的任务摘要 |
 | `/mcp` | 列出已加载的 MCP 工具 |
 | `/reasoning` | 切换思考过程展示（开/关） |
+| `/allow <工具>` | 放行工具（本会话 sticky + 写入 config.toml 跨会话记住） |
 | `/help` `/exit` | 帮助 / 退出 |
 
 ## 工具与权限
@@ -132,6 +134,8 @@ REPL 命令：
 | `search` | read | 递归正则搜索（自动跳过 .git/node_modules 等；自动放行） |
 
 确认交互：`y` 执行一次 / `a` 本会话总是允许（sticky，之后不再问）/ `n` 拒绝（拒绝结果回喂模型，模型会调整方案）。无确认交互的环境（管道/headless）默认拒绝，保证安全。
+
+权限规则表（`config.toml` 的 `[permissions]`，P2）：`allow` 始终放行（不确认）、`ask` 总是确认（即使 read 档）、`deny` 拒绝且工具从模型可见的工具池中裁剪（P10）；`/allow <工具>` 把批准写回 config.toml 跨会话记住。未命中规则回落三档。
 
 ## 配置
 
@@ -160,6 +164,11 @@ memory_auto = false            # 任务计划完成时自动存会话摘要（�
 command = "python"             # 启动命令
 args = ["path/to/server.py"]
 permission = "exec"            # 该 server 工具默认权限档：read | write | exec
+
+[permissions]                  # P2：权限规则（/allow 可追加写入）
+allow = ["shell"]              # 始终放行（不确认）
+# ask = ["read_file"]          # 总是确认（即使 read 档）
+# deny = ["write_file"]        # 拒绝且模型看不到（schemas 裁剪）
 ```
 
 其他：`log_level`（日志级别）、`data_dir`（数据目录，默认本机 `~/.vgent`，可用环境变量 `VGENT_HOME` 覆盖）。
@@ -202,7 +211,7 @@ v2 演进模块：`task.py`（任务计划）、`state.py`（状态机）、`ref
 ## 开发
 
 ```bash
-uv run pytest           # 测试（170 例）
+uv run pytest           # 测试（202 例）
 uv run ruff check .     # lint
 ```
 

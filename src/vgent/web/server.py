@@ -33,7 +33,7 @@ from vgent.llm import ChatResult, LLMClient
 from vgent.mcp import load_into_registry
 from vgent.memory.episodic import EpisodicMemory, summarize
 from vgent.messages import Message
-from vgent.permission import ConfirmResult, PermissionSystem
+from vgent.permission import ConfirmResult, PermissionSystem, persist_allow
 from vgent.store import SessionStore
 from vgent.task import plan_from_messages
 from vgent.tools import ToolRegistry, default_tools
@@ -48,6 +48,7 @@ COMMAND_HELP = """命令：
   /plan            查看任务计划（/plan new 清除并重新规划）
   /compact         压缩当前会话（LLM 摘要中间历史，下次对话生效）
   /reasoning       切换思考过程展示（开/关）
+  /allow <工具>    放行工具（本会话 sticky + 写入 config.toml 跨会话记住）
   /remember <主题> 记住当前会话（LLM 摘要存本机）
   /recall <关键词> 检索历史记忆并注入上下文
   /memories        列出已记住的任务摘要
@@ -180,6 +181,7 @@ class HubManager:
         self.llm = llm or LLMClient(cfg)
         self.tools = tools or default_tools()
         self.mcp_loaded = load_into_registry(self.tools, cfg.mcp_servers)
+        self.tools.filter_denied(cfg.permissions.deny)  # P10：deny 工具裁剪
         self.memory = EpisodicMemory(cfg.data_dir / "memory" / "episodic.jsonl")
         found = find_instructions(os.getcwd())
         self.instructions = found[1] if found else None
@@ -214,9 +216,10 @@ class HubManager:
                     instructions=self.instructions,
                     instructions_name=self.instructions_name,
                     user_instructions=self.user_instructions,  # P6
+                    data_dir=self.cfg.data_dir,  # P2：/allow 持久化
                 )
                 hub = SessionHub(ctx)
-                ctx.permissions = PermissionSystem(confirm=hub.confirm)
+                ctx.permissions = PermissionSystem(confirm=hub.confirm, rules=self.cfg.permissions)  # P2
                 self._hubs[sid] = hub
             return hub
 
@@ -248,7 +251,24 @@ def run_command(text: str, hub: SessionHub) -> str:
         return _cmd_recall(hub, text[len("/recall ") :].strip())
     if text == "/mcp":
         return _cmd_mcp(hub)
+    if text == "/allow" or text.startswith("/allow "):
+        return _cmd_allow(hub, text[len("/allow ") :].strip() if text != "/allow" else "")
     return f"未知命令：{text}（/help 查看）"
+
+
+def _cmd_allow(hub: SessionHub, name: str) -> str:
+    """P2：/allow —— sticky + 持久化（与 cli._allow_inline 同语义，返回文本）。"""
+    ctx = hub.ctx
+    if not name:
+        if ctx.permissions.rules.allow:
+            return "当前持久化 allow：" + ", ".join(ctx.permissions.rules.allow)
+        return "用法：/allow <工具名>（本会话 sticky + 写入 config.toml 跨会话记住）"
+    ctx.permissions.approve_sticky(name)
+    persisted = False
+    if ctx.data_dir is not None:
+        persisted = persist_allow(ctx.data_dir, name)
+    suffix = "，已写入 config.toml（跨会话生效）" if persisted else "（本会话生效；未持久化）"
+    return f"已放行 {name}{suffix}"
 
 
 def _cmd_compact(hub: SessionHub) -> str:

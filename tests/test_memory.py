@@ -155,3 +155,39 @@ def test_summarize_prefers_summary_over_reasoning() -> None:
     assert summarize([Message("user", "hi")], BothLLM(), "x") == (
         "正文里的结构化摘要：扫描了三个文件，结论是升级依赖"
     )
+
+
+# -- P5：记忆按项目隔离 ---------------------------------------------------------
+
+
+def test_project_field_and_filter(tmp_path) -> None:
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    mem.add("A 项目重构", "摘要A", "s1", "A", project="proj-a")
+    mem.add("B 项目优化", "摘要B", "s2", "B", project="proj-b")
+    # 指定项目：只在该项目内检索（自动回忆防串味）
+    assert [e.topic for e in mem.search("项目", project="proj-a")] == ["A 项目重构"]
+    # project=None：跨项目（/recall 显式检索）
+    assert len(mem.search("项目")) == 2
+    # 反向匹配仍生效（用户消息提到 topic）
+    assert len(mem.search("继续上次那个 A 项目重构")) == 1
+
+
+def test_project_default_is_cwd_basename(tmp_path) -> None:
+    import os
+    from pathlib import Path
+
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    e = mem.add("主题", "摘要", "s1", "t")
+    assert e.project == Path(os.getcwd()).name
+
+
+def test_legacy_entry_without_project(tmp_path) -> None:
+    """旧 JSONL（无 project 字段）照常加载；项目过滤时不串味。"""
+    mem = EpisodicMemory(tmp_path / "m.jsonl")
+    mem.path.write_text(
+        '{"ts": "2026-01-01", "session_id": "s", "title": "t", "topic": "旧主题", "summary": "旧摘要"}\n',
+        encoding="utf-8",
+    )
+    hits = mem.search("旧主题")
+    assert len(hits) == 1 and hits[0].project == ""
+    assert mem.search("旧主题", project="proj-a") == []

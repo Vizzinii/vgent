@@ -47,6 +47,21 @@ class ContextConfig:
 
 
 @dataclass
+class PermissionRules:
+    """P2：config.toml [permissions] 规则表（决策 7 升级：拍板可跨会话记住）。
+
+    - allow：始终放行（不确认，即使 write/exec 档）；
+    - ask：总是确认（即使 read 档）；
+    - deny：拒绝且工具从 schemas() 裁剪（模型看不到，P10）。
+    未命中规则回落三档（read 自动 / write+exec 确认 / 未知拒绝）。
+    """
+
+    allow: list[str] = field(default_factory=list)
+    ask: list[str] = field(default_factory=list)
+    deny: list[str] = field(default_factory=list)
+
+
+@dataclass
 class MCPServerConfig:
     """M9：一个 MCP 服务器（stdio 启动命令 + 工具默认权限档位）。"""
 
@@ -66,6 +81,7 @@ class Config:
     log_level: str = "INFO"
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    permissions: PermissionRules = field(default_factory=PermissionRules)  # P2
     show_reasoning: bool = False  # M5：流式展示模型思考过程（/reasoning 可随时切换）
     memory_auto: bool = False  # M8：任务计划完成时自动生成会话摘要并存储（每会话一次）
     mcp_servers: dict[str, MCPServerConfig] = field(default_factory=dict)  # M9：MCP 服务器
@@ -113,6 +129,14 @@ def load_config(path: Path | None = None, provider: str | None = None) -> Config
                     cwd=str(section["cwd"]) if section.get("cwd") else None,
                     permission=permission,
                 )
+    # P2：权限规则（[permissions] allow/ask/deny 数组；非数组忽略）
+    if "permissions" in data and isinstance(data["permissions"], dict):
+        p = data["permissions"]
+        cfg.permissions = PermissionRules(
+            allow=[str(x) for x in p["allow"]] if isinstance(p.get("allow"), list) else [],
+            ask=[str(x) for x in p["ask"]] if isinstance(p.get("ask"), list) else [],
+            deny=[str(x) for x in p["deny"]] if isinstance(p.get("deny"), list) else [],
+        )
 
     providers = _resolve_providers(data)
     if providers:

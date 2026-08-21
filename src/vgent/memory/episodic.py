@@ -5,10 +5,13 @@
 - 检索：关键词子串匹配（v1 不做向量），命中注入上下文；
 - 触发：`/remember <主题>` 显式存储；`/recall <关键词>` 显式检索并落库注入；
   `/memories` 列出；`memory_auto=true` 时任务计划完成自动存储（每会话去重）。
+- P5：条目带 `project` 字段（cwd 顶层目录名），自动回忆只搜当前项目（防跨项目串味）；
+  /recall 显式检索仍跨项目（用户明确要求关键词）。
 """
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,6 +38,14 @@ _TAIL_WINDOW = 30  # 摘要只看最近 N 条（够用，省 token）
 _MIN_SUMMARY_CHARS = 20
 
 
+def current_project() -> str:
+    """P5：当前项目键 = cwd 顶层目录名（vgent 从项目根启动时的目录名）。
+
+    用于记忆条目归属与自动回忆过滤；在不同项目启动 vgent 时自然隔离。
+    """
+    return Path(os.getcwd()).name
+
+
 @dataclass
 class MemoryEntry:
     ts: str
@@ -42,6 +53,7 @@ class MemoryEntry:
     title: str
     topic: str
     summary: str
+    project: str = ""  # P5：归属项目（旧数据无该字段 = ""，检索时不属于任何项目）
 
     def to_line(self) -> str:
         return json.dumps(self.__dict__, ensure_ascii=False)
@@ -56,6 +68,7 @@ class MemoryEntry:
                 str(data["title"]),
                 str(data["topic"]),
                 str(data["summary"]),
+                str(data.get("project", "")),
             )
         except (json.JSONDecodeError, KeyError, TypeError):
             return None  # 坏行跳过，不阻断
@@ -65,8 +78,16 @@ class EpisodicMemory:
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def add(self, topic: str, summary: str, session_id: str, title: str) -> MemoryEntry:
-        entry = MemoryEntry(_now(), session_id, title, topic, summary)
+    def add(
+        self,
+        topic: str,
+        summary: str,
+        session_id: str,
+        title: str,
+        project: str | None = None,
+    ) -> MemoryEntry:
+        """追加一条记忆；project 缺省取当前 cwd 顶层目录名（P5）。"""
+        entry = MemoryEntry(_now(), session_id, title, topic, summary, project or current_project())
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as f:
             f.write(entry.to_line() + "\n")
@@ -76,15 +97,25 @@ class EpisodicMemory:
         """该会话是否已存过摘要（自动存储去重用）。"""
         return any(e.session_id == session_id for e in self._entries())
 
-    def search(self, keyword: str, limit: int = 3) -> list[MemoryEntry]:
+    def search(
+        self,
+        keyword: str,
+        limit: int = 3,
+        project: str | None = None,
+    ) -> list[MemoryEntry]:
         """关键词匹配（大小写不敏感，双向）：keyword 命中 topic/summary，
-        或 topic 出现在 keyword 里（自动回忆：用户消息提到上次主题）；返回最近 limit 条。"""
+        或 topic 出现在 keyword 里（自动回忆：用户消息提到上次主题）；返回最近 limit 条。
+
+        P5：project 给定时只在该项目内检索（自动回忆防跨项目串味）；
+        project=None 跨项目（/recall 显式检索，用户明确要求关键词）。
+        """
         kw = keyword.strip().lower()
         if not kw:
             return []
         hits = [
             e for e in self._entries()
-            if kw in e.topic.lower() or kw in e.summary.lower() or e.topic.lower() in kw
+            if (project is None or e.project == project)
+            and (kw in e.topic.lower() or kw in e.summary.lower() or e.topic.lower() in kw)
         ]
         return hits[-limit:]
 

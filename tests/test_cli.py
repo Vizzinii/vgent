@@ -346,3 +346,103 @@ def test_dispatch_external_error_not_crash(tmp_path) -> None:
     )
     assert _dispatch_command("/boom", ctx, Console(), lambda p: "", tmp_path / "last", {"n": 0}) is True
     store.close()
+
+
+# -- P8：--print 无头单次执行 + P2 /allow ---------------------------------------
+
+
+def test_print_flag_parse() -> None:
+    assert _build_parser().parse_args(["--print", "你好"]).print_query == "你好"
+    assert _build_parser().parse_args(["-p", "hi"]).print_query == "hi"
+    assert _build_parser().parse_args([]).print_query is None
+
+
+def test_run_headless_prints_and_persists(tmp_path, monkeypatch) -> None:
+    """P8：无头跑一轮 → 流式输出到 stdout、会话落库、exit 0。"""
+    import io
+
+    from vgent.cli import _run_headless
+    from vgent.llm import ChatResult
+    from vgent.messages import Message, Usage
+
+    class FakeLLM:
+        def chat(self, messages, tools=None, on_delta=None, on_reasoning=None):
+            if on_delta:
+                on_delta("流式内容")
+            return ChatResult(messages=[Message("assistant", "流式内容")], usage=Usage(1, 1, 2))
+
+    monkeypatch.setattr("vgent.cli.LLMClient", lambda cfg: FakeLLM())
+    store = _store(tmp_path)
+    buf = io.StringIO()
+    code = _run_headless(Config(data_dir=tmp_path), store, "问题", Console(file=buf))
+    assert code == 0
+    assert "流式内容" in buf.getvalue()
+    sessions = store.list_sessions()
+    assert len(sessions) == 1
+    assert [m.role for m in store.get_history(sessions[0].id)] == ["user", "assistant"]
+    store.close()
+
+
+def test_run_headless_rejects_exec_tool(tmp_path, monkeypatch) -> None:
+    """P8 headless 安全默认：无确认交互 → write/exec 自动拒绝（拒绝回喂模型）。"""
+    import io
+
+    from vgent.cli import _run_headless
+    from vgent.llm import ChatResult
+    from vgent.messages import Message, ToolCall, Usage
+
+    responses = [
+        ChatResult(
+            messages=[
+                Message("assistant", "", tool_calls=[ToolCall("c1", "shell", '{"command":"rm x"}')])
+            ],
+            usage=Usage(1, 1, 2),
+            tool_calls=[ToolCall("c1", "shell", '{"command":"rm x"}')],
+        ),
+        ChatResult(messages=[Message("assistant", "Failure: 用户拒绝\nAction: 放弃")], usage=Usage(2, 1, 3)),
+        ChatResult(messages=[Message("assistant", "已停止")], usage=Usage(3, 1, 4)),
+    ]
+
+    class Scripted:
+        def __init__(self) -> None:
+            self.rs = list(responses)
+
+        def chat(self, messages, tools=None, on_delta=None, on_reasoning=None):
+            return self.rs.pop(0)
+
+    monkeypatch.setattr("vgent.cli.LLMClient", lambda cfg: Scripted())
+    store = _store(tmp_path)
+    buf = io.StringIO()
+    code = _run_headless(Config(data_dir=tmp_path), store, "删掉 x", Console(file=buf))
+    assert code == 0
+    hist = store.get_history(store.list_sessions()[0].id)
+    tool_msgs = [m for m in hist if m.role == "tool"]
+    assert any("拒绝" in m.content for m in tool_msgs)
+    store.close()
+
+
+def test_allow_inline_sticky_and_persist(tmp_path) -> None:
+    """P2：/allow —— 本会话 sticky + 写回 config.toml [permissions].allow。"""
+    import tomllib
+    from types import SimpleNamespace
+
+    from vgent.agent import SessionContext
+    from vgent.cli import _allow_inline
+    from vgent.permission import Approval
+    from vgent.tools import ToolSchema
+
+    (tmp_path / "config.toml").write_text('[provider]\nactive = "deepseek"\n', encoding="utf-8")
+    store = _store(tmp_path)
+    sid = store.create_session()
+    ctx = SessionContext(
+        session_id=sid,
+        store=store,
+        llm=SimpleNamespace(chat=lambda *a, **k: None),
+        data_dir=tmp_path,
+    )
+    _allow_inline(ctx, Console(), "shell")
+    assert ctx.permissions.check(ToolSchema("shell", "d", {"type": "object"}, "exec"), {}) is Approval.AUTO
+    data = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
+    assert data["permissions"]["allow"] == ["shell"]
+    _allow_inline(ctx, Console(), "")  # 无参数：用法提示，不崩溃
+    store.close()

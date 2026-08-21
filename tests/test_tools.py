@@ -248,3 +248,19 @@ def test_resolve_shell_via_registry(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(tools, "_SHELL_CANDIDATES", ())
     monkeypatch.setattr("vgent.tools.shutil.which", lambda n: None)  # PATH 里无 bash/git
     assert tools._resolve_shell() == str(fake)
+
+
+# -- P10：deny 工具裁剪 ---------------------------------------------------------
+
+
+def test_filter_denied_removes_from_schemas() -> None:
+    """P10：deny 工具从注册表移除——schemas() 不再暴露（模型看不到）。"""
+    reg = default_tools()
+    names = {s["function"]["name"] for s in reg.schemas()}
+    assert "shell" in names
+    reg.filter_denied(["shell"])
+    names = {s["function"]["name"] for s in reg.schemas()}
+    assert "shell" not in names
+    assert reg.get("shell") is None
+    # 未注册的名字无害
+    reg.filter_denied(["no_such_tool"])

@@ -337,3 +337,32 @@ def test_command_endpoint(tmp_path) -> None:
     finally:
         s.close()
         m.store.close()
+
+
+def test_deny_pruning_and_allow_command(tmp_path) -> None:
+    """P10：deny 工具从 schemas 裁剪（模型看不到）；P2：/allow 写回 config.toml。"""
+    import tomllib
+
+    from vgent.config import PermissionRules
+
+    (tmp_path / "config.toml").write_text('[provider]\nactive = "deepseek"\n', encoding="utf-8")
+    cfg = Config(data_dir=tmp_path)
+    cfg.permissions = PermissionRules(deny=["shell"], allow=["read_file"])
+    store = SessionStore(tmp_path / "t.db")
+    m = HubManager(cfg, store, FakeLLM())
+    names = {s["function"]["name"] for s in m.tools.schemas()}
+    assert "shell" not in names  # deny 裁剪
+    assert "read_file" in names
+    s = _Server(m)
+    try:
+        _, body = s.post("/api/sessions", {})
+        sid = body["session_id"]
+        code, resp = s.post(f"/api/sessions/{sid}/command", {"command": "/allow"})
+        assert code == 200 and "read_file" in resp["text"]  # 列出当前持久化 allow
+        code, resp = s.post(f"/api/sessions/{sid}/command", {"command": "/allow write_file"})
+        assert code == 200 and "已放行" in resp["text"]
+        data = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
+        assert data["permissions"]["allow"] == ["write_file"]
+    finally:
+        s.close()
+        m.store.close()

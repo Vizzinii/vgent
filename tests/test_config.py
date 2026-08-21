@@ -142,3 +142,25 @@ def test_mcp_bad_permission_defaults_exec(tmp_path) -> None:
     p = tmp_path / "config.toml"
     p.write_text('[mcp.servers.x]\ncommand = "python"\npermission = "sudo"\n', encoding="utf-8")
     assert load_config(p).mcp_servers["x"].permission == "exec"
+
+
+def test_permissions_rules_parsed(tmp_path) -> None:
+    """P2：[permissions] allow/ask/deny 数组解析。"""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[permissions]\nallow = ["shell"]\nask = ["read_file"]\ndeny = ["write_file"]\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(p)
+    assert cfg.permissions.allow == ["shell"]
+    assert cfg.permissions.ask == ["read_file"]
+    assert cfg.permissions.deny == ["write_file"]
+
+
+def test_permissions_invalid_or_missing(tmp_path) -> None:
+    """P2：非数组或缺失的 [permissions] → 空规则（不影响默认三档）。"""
+    p = tmp_path / "config.toml"
+    p.write_text('[permissions]\nallow = "not-a-list"\n', encoding="utf-8")
+    assert load_config(p).permissions.allow == []
+    cfg = load_config(tmp_path / "nonexistent.toml")
+    assert cfg.permissions.allow == [] and cfg.permissions.deny == []
