@@ -2,7 +2,7 @@
 
 通用 agent CLI（运行时 harness）——参考 hermes-agent / openai-agents-python / OpenManus / MetaGPT 等主流实现，各取所长。默认模型 DeepSeek（OpenAI-compatible）。
 
-**状态**：v1 完成（M0-M5 ✅，2026-08-20）；v2 演进——M6 任务管理/状态机 ✅、M7 反思循环 ✅、M8 episodic 记忆 ✅、M9 MCP client ✅、M10 zcode 化收尾 ✅（2026-08-21）。设计文档与跨机交接见 [HANDOFF.md](HANDOFF.md)。
+**状态**：v1 完成（M0-M5 ✅，2026-08-20）；v2 演进——M6 任务管理/状态机 ✅、M7 反思循环 ✅、M8 episodic 记忆 ✅、M9 MCP client ✅、M10 zcode 化收尾 ✅（2026-08-21）、M11 Web UI ✅（2026-08-21）。
 
 内置工具：`shell`（exec 档，需确认）、`write_file`（write 档，需确认）、`read_file` / `search`（read 档，自动放行）。REPL 里 `/reasoning` 可切换流式展示模型思考过程（默认关；`config.toml` 顶层 `show_reasoning = true` 可默认开）；`/remember <主题>` 记住当前会话、`/recall <关键词>` 检索历史记忆并注入、`/memories` 列出（episodic 记忆存本机 `~/.vgent/memory/episodic.jsonl`；`config.toml` 顶层 `memory_auto = true` 可在任务计划完成时自动存摘要）。
 
@@ -28,16 +28,23 @@ vgent --provider <name>     # 临时切换 provider
 
 配置在 `~/.vgent/config.toml`：多 provider（`[providers.<name>]` 定义、`[provider] active` 选择，启动可 `vgent --provider <name>` 临时切换；api_key 用文件字段或每 provider 独立的 `api_key_env` 环境变量）；MCP（`[mcp.servers.<name>]` 挂本地 MCP server，stdio 拉起，工具以 `<server>_<tool>` 前缀进入工具面，`/mcp` 查看；示例见 `scripts/mcp_echo_server.py`）。未配置 key 时对话会报 401，但 REPL 不崩溃。
 
+## Web UI（M11，2026-08-21）
+
+```bash
+vgent --serve            # 启动本地 Web 页（自动打开浏览器，127.0.0.1:8477）
+vgent serve --port 8080  # `vgent serve` 是 --serve 的别名写法；--port 指定端口
+```
+
+浏览器页面 = 带 GUI 的 REPL：左侧会话列表（新建/恢复/删除），中间对话区（流式输出、工具执行卡片、思考折叠块），工具权限弹窗（y 一次 / a 本会话总是 / n 拒绝），输入 `/plan` `/compact` `/remember` 等斜杠命令。单用户本地访问（127.0.0.1），无需鉴权；与 CLI 共用同一套会话存储（`~/.vgent/sessions`）。纯 stdlib 实现，零新增依赖。
+
 ## 项目指令与外部命令（M10，zcode 化收尾）
 
 - **AGENTS.md 项目指令**：启动时从工作目录向上找最近的 `AGENTS.md`（`CLAUDE.md` 兜底，8 层上限、8K 字符截断），内容注入首个 LLM 调用（不落库、一次性）——把项目约定写进去即可生效。
 - **外部命令**：`~/.vgent/commands/<name>.py` 里定义 `run(ctx, args: str) -> str`（返回文本由 REPL 打印），REPL 里用 `/<name> 参数` 调用；内置命令优先，坏文件跳过不阻塞启动。
 - **REPL 体验**：prompt_toolkit 下输入 `/` 有命令补全；输入行底部常驻状态栏显示 provider/模型、Agent 状态、计划进度、会话累计 token（Git Bash/管道回退 `input()` 时无补全与工具栏，功能不受影响）。
 
-## 双机开发注意事项（M1 新增）
+## Windows 开发注意事项（M1 新增）
 
-- 本仓库在百度网盘同步盘：**`.venv` 不要进同步盘**。两台机器各自 `uv sync`，且先设置环境变量 `UV_PROJECT_ENVIRONMENT` 指向本机路径（如 `%USERPROFILE%\.vgent\venv-vgent`）。
-- **`.python-version` 钉 3.12.13 是有意的**：项目路径含中文，Python ≤3.12.2 的 site.py 用 locale 编码（中文系统=GBK）读 editable 安装的 `.pth` 会崩溃（`PYTHONUTF8=1` 也无效）；3.12.13+ 改为 utf-8-sig 优先读，无此问题。另一台机器 `uv sync` 会自动下载 3.12.13。
+- **`.python-version` 钉 3.12.13 是有意的**：项目路径含中文时，Python ≤3.12.2 的 site.py 会用 locale 编码（中文系统=GBK）读 editable 安装的 `.pth` 而崩溃（`PYTHONUTF8=1` 也无效）；3.12.13+ 改为 utf-8-sig 优先读取，无此问题。`uv sync` 会自动下载 3.12.13。
 - **Windows 输入适配**：Git Bash/mintty 或管道输入下 prompt_toolkit 拿不到 Windows 控制台（`NoConsoleScreenBufferError`），vgent 自动退回 `input()`；完整交互（多行编辑/历史）请在 Windows Terminal 或 cmd 里运行。
-- 跨机交接：一切状态以 HANDOFF.md 为准（同步盘内）；每里程碑分对话执行，完成后回写「构建日志」。
-- 百度网盘同步瞬间会锁文件，写入报 EBUSY 时等几秒重试。
+- 多机/多用户开发：`.venv` 不要放进同步目录，用环境变量 `UV_PROJECT_ENVIRONMENT` 指到各机本机路径，每台机器各自 `uv sync`。

@@ -1,10 +1,10 @@
 """vgent M9 冒烟用最小 MCP 服务器（FastMCP，stdio 模式）：echo + add 两个工具。
 
 运行：python scripts/mcp_echo_server.py（stdio 协议，由 vgent 的 MCP client 拉起）
-config.toml 示例（本机）：
+config.toml 示例（本机，路径按实际填写）：
     [mcp.servers.echo]
     command = "C:/Users/<user>/.vgent/venv-vgent/Scripts/python.exe"
-    args = ["D:/BaiduSyncdisk/个人/5_personal-projects/1_vgent/scripts/mcp_echo_server.py"]
+    args = ["<本仓库绝对路径>/scripts/mcp_echo_server.py"]
 """
 import warnings
 

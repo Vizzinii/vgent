@@ -1,6 +1,6 @@
 r"""⑤ 上下文引擎 —— ContextEngine（M3，决策 8 综合方案）。
 
-蓝本：hermes-agent ContextCompressor（本机参考库 `D:\大五\8_GitHub网红项目\hermes-agent`）；
+蓝本：hermes-agent ContextCompressor（参考库，只读参照）；
 切点对齐回合边界取自 ag2；硬下限兜底取自 OpenManus。
 
 契约 v0.1：

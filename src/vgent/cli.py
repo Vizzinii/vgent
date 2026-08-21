@@ -242,6 +242,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--list-sessions", action="store_true", help="列出会话后退出")
     parser.add_argument("--delete-session", metavar="ID", help="删除指定会话后退出")
+    parser.add_argument(
+        "--serve", action="store_true", help="启动本地 Web UI（浏览器页面，M11）"
+    )
+    parser.add_argument(
+        "--port", type=int, default=8477, help="--serve 的端口（默认 8477）"
+    )
     return parser
 
 
@@ -330,6 +336,10 @@ def _resolve_start_session(
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # 兼容 `vgent serve` 写法（argparse 无子命令，转成 --serve）
+    if argv and argv[0] == "serve":
+        argv = ["--serve", *argv[1:]]
     args = _build_parser().parse_args(argv)
     try:
         cfg = load_config(provider=args.provider)
@@ -345,6 +355,11 @@ def main(argv: list[str] | None = None) -> int:
         code = _headless(store, args, console)
         if code is not None:
             return code
+        if args.serve:  # M11：本地 Web UI（独立入口，CLI 保留双入口）
+            store.close()
+            from vgent.web.server import serve as web_serve
+
+            return web_serve(cfg, port=args.port)
         console.print(
             f"[bold green]vgent[/bold green] v{__version__} — \\[{cfg.provider.name}] {cfg.provider.model}"
         )

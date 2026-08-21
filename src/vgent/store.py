@@ -2,11 +2,14 @@
 
 蓝本：openai-agents SQLiteSession（agent_sessions + agent_messages 双表、WAL）；
 thread_id 主键概念取自 langgraph。路径在本机 ~/.vgent/sessions/，不进同步盘（决策 7）。
+M11：Web UI 多线程访问——check_same_thread=False + RLock 串行化 + busy_timeout。
 """
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -23,6 +26,17 @@ class SessionMeta:
     message_count: int
 
 
+def _locked(method):
+    """串行化 store 访问：Web UI 多线程与 CLI 单线程都安全。"""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class SessionStore:
     """vgent 会话库。
 
@@ -34,8 +48,10 @@ class SessionStore:
 
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path))
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS sessions ("
             "id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL)"
@@ -59,11 +75,13 @@ class SessionStore:
         )
         self._conn.commit()
 
+    @_locked
     def close(self) -> None:
         self._conn.close()
 
     # -- 会话 CRUD ---------------------------------------------------------
 
+    @_locked
     def create_session(self, title: str = "新会话") -> str:
         sid = uuid.uuid4().hex
         self._conn.execute(
@@ -73,6 +91,7 @@ class SessionStore:
         self._conn.commit()
         return sid
 
+    @_locked
     def list_sessions(self) -> list[SessionMeta]:
         rows = self._conn.execute(
             "SELECT s.id, s.title, s.created_at, COUNT(m.id) "
@@ -81,17 +100,20 @@ class SessionStore:
         ).fetchall()
         return [SessionMeta(r[0], r[1], r[2], r[3]) for r in rows]
 
+    @_locked
     def delete_session(self, session_id: str) -> None:
         self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         self._conn.commit()
 
+    @_locked
     def get_title(self, session_id: str) -> str | None:
         row = self._conn.execute(
             "SELECT title FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
         return row[0] if row else None
 
+    @_locked
     def update_title(self, session_id: str, title: str) -> None:
         """M4：首条用户消息自动生成会话标题。"""
         self._conn.execute(
@@ -101,6 +123,7 @@ class SessionStore:
 
     # -- 消息 ---------------------------------------------------------------
 
+    @_locked
     def add_message(self, session_id: str, msg: Message) -> None:
         self._conn.execute(
             "INSERT INTO messages "
@@ -118,10 +141,12 @@ class SessionStore:
         )
         self._conn.commit()
 
+    @_locked
     def add_messages(self, session_id: str, msgs: list[Message]) -> None:
         for m in msgs:
             self.add_message(session_id, m)
 
+    @_locked
     def get_history(self, session_id: str) -> list[Message]:
         rows = self._conn.execute(
             "SELECT role, content, reasoning_content, tool_calls, tool_call_id FROM messages "
@@ -134,6 +159,7 @@ class SessionStore:
 
     # -- M6：任务计划消息与会话状态 -------------------------------------------
 
+    @_locked
     def upsert_plan_message(self, session_id: str, text: str) -> None:
         """替换会话里的计划消息：历史中只保留最新一份（LIKE 匹配标记）。"""
         self._conn.execute(
@@ -143,6 +169,7 @@ class SessionStore:
         )
         self.add_message(session_id, Message("system", text))
 
+    @_locked
     def clear_plan(self, session_id: str) -> None:
         """/plan new：清掉计划消息，下次对话重新规划。"""
         self._conn.execute(
@@ -152,6 +179,7 @@ class SessionStore:
         )
         self._conn.commit()
 
+    @_locked
     def set_state(self, session_id: str, state: str) -> None:
         """落当前 Agent 状态（M6：每轮结束写一次，供恢复/展示）。"""
         self._conn.execute(
@@ -162,6 +190,7 @@ class SessionStore:
         )
         self._conn.commit()
 
+    @_locked
     def get_state(self, session_id: str) -> str | None:
         row = self._conn.execute(
             "SELECT state FROM session_states WHERE session_id = ?", (session_id,)
