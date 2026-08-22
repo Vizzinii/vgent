@@ -81,6 +81,10 @@ class SessionStore:
             "summary TEXT NOT NULL, retained TEXT NOT NULL,"
             "boundary_id INTEGER NOT NULL, updated_at TEXT NOT NULL)"
         )
+        # 评审 F16：messages 按 session 查询加索引（get_history 原为全表扫描）
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)"
+        )
         self._conn.commit()
 
     @_locked

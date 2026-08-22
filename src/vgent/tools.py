@@ -24,6 +24,15 @@ Permission = Literal["read", "write", "exec"]
 
 # 工具输出硬上限：防病态输出撑爆上下文（M3 的剪枝是精细层，这里是安全底）
 _OUTPUT_CAP = 10_000
+# 读入文件大小上限（评审 F7，与 snapshot.MAX_FILE_BYTES 同口径）：防整读超大文件撑爆内存
+_MAX_FILE_BYTES = 5 * 1024 * 1024
+
+
+def _oversized(path: Path) -> bool:
+    try:
+        return path.stat().st_size > _MAX_FILE_BYTES
+    except OSError:
+        return False
 
 
 @dataclass
@@ -183,6 +192,11 @@ def _read_file_handler(args: dict) -> str:
     if not raw:
         return "错误：缺少 path 参数"
     path = Path(str(raw))
+    if _oversized(path):
+        return (
+            f"错误：文件 {path} 超过 5MB 读取上限（防整读撑爆内存）。"
+            "请用 shell 工具 head/tail 分段查看"
+        )
     try:
         offset = max(1, int(args.get("offset", 1) or 1))
     except (TypeError, ValueError):
@@ -228,6 +242,8 @@ def _search_handler(args: dict) -> str:
     results: list[str] = []
     files: list[Path]
     if path.is_file():
+        if _oversized(path):
+            return f"错误：文件 {path} 超过 5MB 读取上限（防整读撑爆内存）"
         files = [path]
     elif path.is_dir():
         files = []
@@ -240,6 +256,8 @@ def _search_handler(args: dict) -> str:
     for f in files:
         if len(results) >= limit:
             break
+        if _oversized(f):  # 评审 F7：超大文件跳过不整读（单文件目标在上面前已拦）
+            continue
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -299,11 +317,17 @@ def _edit_file_handler(args: dict) -> str:
     else:
         replace_all = bool(ra)
     path = Path(raw)
+    if _oversized(path):
+        return (
+            f"错误：文件 {path} 超过 5MB 读取上限（防整读撑爆内存），已拒绝编辑。"
+            "请用 shell 工具处理该文件"
+        )
     try:
-        # 严格解码（评审 F2）：errors="replace" 读 + 写回 = 有损往返，非 UTF-8 文件
-        # （如 GBK）编辑一次原文就永久损坏——拒绝编辑并回喂模型。
-        # read_text 默认 errors="strict" 且带通用换行转换（与写回 write_text 配对）
-        text = path.read_text(encoding="utf-8")
+        # 字节级保真（复审跟进）：read_text/write_text 在 Windows 做换行翻译
+        # （读折叠 CRLF→LF、写展开 LF→CRLF），LF 文件编辑一次就整文件变 CRLF——
+        # 改 read_bytes/write_bytes，除替换段外原字节不动。
+        # 严格解码（评审 F2）：非 UTF-8 文件拒绝编辑，防有损写回损坏原文。
+        text = path.read_bytes().decode("utf-8")
     except OSError as exc:
         return f"读取失败：{exc}"
     except UnicodeDecodeError:
@@ -311,6 +335,12 @@ def _edit_file_handler(args: dict) -> str:
             "错误：文件含非 UTF-8 字节，已拒绝编辑（防止有损写回损坏原文）。"
             "请先用 shell 工具确认文件编码/内容，或让用户处理后重试"
         )
+    # CRLF 兼容匹配（复审跟进）：模型习惯给 \n 风格的 old_string，
+    # 文件为 CRLF 时自动换算一次再匹配（写回保持文件的 CRLF）
+    if old and "\n" in old and "\r\n" not in old and "\r\n" in text:
+        count = text.count(old)
+        if count == 0:
+            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
     count = text.count(old)
     if count == 0:
         return (
@@ -323,7 +353,7 @@ def _edit_file_handler(args: dict) -> str:
             "请提供更多上下文使 old_string 唯一匹配，或设置 replace_all=true"
         )
     try:
-        path.write_text(text.replace(old, new), encoding="utf-8")
+        path.write_bytes(text.replace(old, new).encode("utf-8"))
     except OSError as exc:
         return f"写入失败：{exc}"
     return f"已替换 {count} 处 → {path}"

@@ -47,6 +47,8 @@ DEFAULT_PORT = 8477
 CONFIRM_TIMEOUT = 600.0  # 确认弹窗最长等待（秒）；超时按拒绝处理（防挂死 turn）
 HEARTBEAT = 15.0  # SSE 心跳间隔（秒），保持连接不被中间层掐断
 _TOOL_SUMMARY_CAP = 120  # 工具结果状态行首行截断（与 CLI 状态行口径一致）
+# 评审 F6：本机 Origin 白名单（浏览器页面 drive-by 防护；无 Origin 的客户端放行）
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 COMMAND_HELP = """命令：
   /plan            查看任务计划（/plan new 清除并重新规划）
@@ -271,9 +273,12 @@ def run_command(text: str, hub: SessionHub) -> str:
     if text == "/compact":
         return _cmd_compact(hub)
     if text == "/plan" or text.startswith("/plan "):
-        return _cmd_plan(hub, redo=("new" in text or "redo" in text))
-    if text == "/memories" or text == "/remember":
+        arg = text[len("/plan "):].strip() if text != "/plan" else ""
+        return _cmd_plan(hub, redo=arg in ("new", "redo"))  # 评审 F9：精确匹配，/plan renew 不再误清
+    if text == "/memories":
         return _cmd_memories(hub)
+    if text == "/remember":  # 评审 F11：无参提示用法，不再跳去列记忆
+        return "用法：/remember <主题>（如：/remember 优化 git 仓库性能）"
     if text == "/memory" or text.startswith("/memory "):  # M12-C
         return _cmd_memory(hub, text[len("/memory ") :].strip() if text != "/memory" else "")
     if text.startswith("/remember "):
@@ -527,6 +532,43 @@ class WebHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:  # 静默请求日志，避免刷屏
         pass
 
+    # -- 评审 F6：请求伪造防护 -------------------------------------------------
+
+    def _origin_forbidden(self) -> bool:
+        """Origin/Referer 在场且非本机 → 拒绝。
+
+        恶意网页可对 localhost 发 text/plain 跨域简单 POST（免预检）驱动 agent；
+        非浏览器客户端（curl/测试）不带这些头，放行。SOP 挡读取挡不住发送，
+        「localhost 无鉴权」边界只豁免鉴权，不豁免请求伪造。
+        复审跟进：头存在但解析不出本机 host（如 Origin: null——sandboxed iframe
+        可发出）也一律拒绝。
+        """
+        for header in ("Origin", "Referer"):
+            raw = self.headers.get(header)
+            if not raw:
+                continue
+            host = (urlparse(raw).hostname or "").lower()
+            if host not in _LOCAL_HOSTS:
+                return True
+        return False
+
+    def _host_forbidden(self) -> bool:
+        """评审跟进：Host 头校验——DNS rebinding 下 GET 仍可读会话（Origin 盖不住 GET）。"""
+        raw = self.headers.get("Host") or ""
+        host = raw.rsplit(":", 1)[0].strip("[]").lower()
+        return host not in _LOCAL_HOSTS
+
+    def _json_content_type(self) -> bool:
+        """带体的 POST 必须声明 application/json（跨域简单请求绕过预检的口子）。"""
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return True
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        return ctype == "application/json"
+
     # -- 路由 ---------------------------------------------------------------
 
     def do_GET(self) -> None:
@@ -534,6 +576,8 @@ class WebHandler(BaseHTTPRequestHandler):
             parts = self._parts(self.path)
             if not parts or parts[0] != "api":
                 return self._send_static()
+            if self._host_forbidden():  # 评审跟进
+                return self._send_json(403, {"error": "forbidden host"})
             self._api_get(parts)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -542,6 +586,12 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            if self._origin_forbidden():  # 评审 F6
+                return self._send_json(403, {"error": "forbidden origin"})
+            if self._host_forbidden():  # 评审跟进
+                return self._send_json(403, {"error": "forbidden host"})
+            if not self._json_content_type():  # 评审 F6
+                return self._send_json(400, {"error": "content-type must be application/json"})
             parts = self._parts(self.path)
             if not parts or parts[0] != "api":
                 return self._send_json(404, {"error": "not found"})
@@ -553,6 +603,10 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         try:
+            if self._origin_forbidden():  # 评审 F6
+                return self._send_json(403, {"error": "forbidden origin"})
+            if self._host_forbidden():  # 评审跟进
+                return self._send_json(403, {"error": "forbidden host"})
             parts = self._parts(self.path)
             if parts[:2] == ["api", "sessions"] and len(parts) == 3:
                 m = self.manager

@@ -46,10 +46,12 @@ class LLMClient:
         self.max_retries = max_retries
         # SDK 构造时要求非空 key；未配置时用占位 key，让失败发生在请求时（401），
         # 由 REPL 兜底优雅报错，而不是启动即崩。max_retries=0：重试由本类自建。
+        # timeout=120（评审 F15）：SDK 默认 600s，卡死请求要等 10 分钟才进重试。
         self._client = OpenAI(
             base_url=cfg.provider.base_url,
             api_key=cfg.api_key_resolved() or "sk-vgent-missing-key",
             max_retries=0,
+            timeout=120.0,
         )
 
     def chat(
@@ -77,6 +79,9 @@ class LLMClient:
                 attempt += 1
                 if attempt > self.max_retries:
                     raise
+                # 评审 F13：失败前可能已流出部分增量，重试会从头再流——发提示防用户困惑
+                if on_delta:
+                    on_delta("\n（网络错误，重试中，输出可能重复……）\n")
                 delay = _RETRY_BACKOFF[min(attempt - 1, len(_RETRY_BACKOFF) - 1)]
                 time.sleep(delay)
 

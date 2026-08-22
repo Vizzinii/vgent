@@ -276,9 +276,14 @@ class MemoryPipeline:
             try:
                 self._process_batch(batch)
             except Exception:
-                logger.warning("memory pipeline failed for %s", self._store.root, exc_info=True)
-                for item in batch:
-                    self._queue.put_nowait(item)
+                # 评审 F14：失败批次丢弃不重排——_process_batch 可能已写 raw/rollout，
+                # 重排会重复写；记忆本就 best-effort，丢一轮可接受
+                logger.warning(
+                    "memory pipeline batch failed for %s; dropping %d rounds",
+                    self._store.root,
+                    len(batch),
+                    exc_info=True,
+                )
                 return
 
     def _process_batch(self, batch: list[RoundContent]) -> None:

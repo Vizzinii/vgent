@@ -363,37 +363,39 @@ def _run_headless(cfg: Config, store: SessionStore, query: str, console: Console
     P2 规则照常生效（allow 放行、deny 裁剪）。失败时输出错误并返回 1（可脚本判断）。
     """
     session_id = store.create_session()
-    llm = LLMClient(cfg)
-    tools = default_tools()
-    load_into_registry(tools, cfg.mcp_servers)
-    for t in make_memory_tools(cfg.data_dir, Path(os.getcwd())):  # M12-C：记忆检索工具
-        tools.register(t.schema, t.handler)
-    tools.filter_denied(cfg.permissions.deny)  # P10
-    engine = ContextEngine(cfg.provider.context_length, cfg.context)
-    engine.summarizer = _make_summarizer(llm)
-    found_user = find_user_instructions(cfg.data_dir)  # P6
-    found = find_instructions(os.getcwd())  # M10
-    ctx = SessionContext(
-        session_id=session_id,
-        store=store,
-        llm=llm,
-        tools=tools,
-        permissions=PermissionSystem(rules=cfg.permissions),  # P2：无交互 → 默认拒绝
-        engine=engine,
-        show_reasoning=cfg.show_reasoning,
-        memory=EpisodicMemory(cfg.data_dir / "memory" / "episodic.jsonl"),  # M8
-        memory_auto=cfg.memory_auto,
-        instructions=found[1] if found else None,
-        instructions_name=found[0] if found else None,
-        user_instructions=found_user[1] if found_user else None,
-        data_dir=cfg.data_dir,  # P2
-    )
-    try:
+    try:  # 复审跟进：构造段也在 finally 保护内，异常不留残留会话
+        llm = LLMClient(cfg)
+        tools = default_tools()
+        load_into_registry(tools, cfg.mcp_servers)
+        for t in make_memory_tools(cfg.data_dir, Path(os.getcwd())):  # M12-C：记忆检索工具
+            tools.register(t.schema, t.handler)
+        tools.filter_denied(cfg.permissions.deny)  # P10
+        engine = ContextEngine(cfg.provider.context_length, cfg.context)
+        engine.summarizer = _make_summarizer(llm)
+        found_user = find_user_instructions(cfg.data_dir)  # P6
+        found = find_instructions(os.getcwd())  # M10
+        ctx = SessionContext(
+            session_id=session_id,
+            store=store,
+            llm=llm,
+            tools=tools,
+            permissions=PermissionSystem(rules=cfg.permissions),  # P2：无交互 → 默认拒绝
+            engine=engine,
+            show_reasoning=cfg.show_reasoning,
+            memory=EpisodicMemory(cfg.data_dir / "memory" / "episodic.jsonl"),  # M8
+            memory_auto=cfg.memory_auto,
+            instructions=found[1] if found else None,
+            instructions_name=found[0] if found else None,
+            user_instructions=found_user[1] if found_user else None,
+            data_dir=cfg.data_dir,  # P2
+        )
         run_turn(query, ctx, on_delta=lambda d: console.print(d, end="", markup=False))
         console.print()
     except Exception as exc:  # noqa: BLE001 — 无头模式失败要可见且可脚本判断
         console.print(f"[red]调用失败：{exc}[/red]")
         return 1
+    finally:
+        store.delete_session(session_id)  # 评审 F12：headless 一次性会话，跑完即清不污染列表
     return 0
 
 
@@ -577,13 +579,17 @@ def _dispatch_command(
         _compact_inline(ctx, console)
         return True
     if text == "/plan" or text.startswith("/plan "):
-        _plan_inline(ctx, console, redo=("new" in text or "redo" in text))
+        arg = text[len("/plan ") :].strip() if text != "/plan" else ""
+        _plan_inline(ctx, console, redo=arg in ("new", "redo"))  # 评审 F9：精确匹配，/plan renew 不再误清
         return True
     if text == "/reflect":
         _reflect_inline(ctx, console)
         return True
-    if text == "/memories" or text == "/remember":
+    if text == "/memories":
         _memories_inline(ctx, console)
+        return True
+    if text == "/remember":  # 评审 F11：无参提示用法，不再跳去列记忆
+        console.print("[yellow]用法：/remember <主题>（如：/remember 优化 git 仓库性能）[/yellow]")
         return True
     if text == "/memory" or text.startswith("/memory "):  # M12-C
         _memory_inline(ctx, console, text[len("/memory ") :].strip() if text != "/memory" else "")

@@ -21,6 +21,24 @@ from vgent.config import PermissionRules
 from vgent.tools import ToolSchema
 
 
+def _outside_workspace(args: dict) -> bool:
+    """评审 F8：write 档工具的目标路径是否越出当前工作区。
+
+    相对路径按 cwd 解析，绝对路径直接判定；解析失败按越界（保守）。
+    用途：越界写盘（改 ~/.vgent/config.toml、.git/config 等）无视 sticky/allow
+    放行、强制确认——恢复决策 7「权限确认即防线」的原意（y 仍可执行，非沙箱）。
+    """
+    raw = str(args.get("path", "") or "").strip()
+    if not raw:
+        return False
+    try:
+        p = Path(raw)
+        resolved = (p if p.is_absolute() else Path.cwd() / p).resolve(strict=False)
+        return not resolved.is_relative_to(Path.cwd().resolve())
+    except (OSError, ValueError):
+        return True
+
+
 class Approval(str, Enum):
     AUTO = "auto"
     NEED_CONFIRM = "need_confirm"
@@ -47,6 +65,9 @@ class PermissionSystem:
         """工具执行前的检查：P2 规则优先，未命中回落三档。"""
         if tool.name in self.rules.deny:
             return Approval.DENIED
+        # 评审 F8：write 档越界路径无视 sticky/allow/ask——强制确认（用户 y 仍可执行）
+        if tool.permission == "write" and _outside_workspace(args):
+            return Approval.NEED_CONFIRM
         if tool.name in self._sticky or tool.name in self.rules.allow:
             return Approval.AUTO
         if tool.name in self.rules.ask:
@@ -59,7 +80,10 @@ class PermissionSystem:
 
     def confirm(self, tool: ToolSchema, args: dict) -> ConfirmResult:
         """走到确认交互；ALWAYS 时自动 sticky（本会话内）。无交互则拒绝。"""
-        if tool.name in self._sticky:
+        # 评审 F8：越界写盘不吃 sticky 短路——check 已强制 NEED_CONFIRM，这里必须真问
+        if tool.name in self._sticky and not (
+            tool.permission == "write" and _outside_workspace(args)
+        ):
             return ConfirmResult.APPROVE
         if self._confirm is None:
             return ConfirmResult.REJECT

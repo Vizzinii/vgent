@@ -119,6 +119,8 @@ class ContextEngine:
     # Summarize 策略用的 LLM 摘要器（cli 注入；None 时 summarize 退回 TailWindow）
     summarizer: Callable[[list[Message]], str] | None = None
     # 当前发送列表的 token 估算：API usage 校准 + 本地启发式（决策 8：usage 计 token）
+    # 评审 F17 注：usage 只是参考值——prune/compress 内的 _sync_estimate 会用启发式
+    # 覆盖它；实际压缩触发以 should_compress_estimated（tiktoken 估算）为准（R6）
     _tokens: int = field(default=0, init=False, repr=False)
     compression_count: int = field(default=0, init=False, repr=False)
     # /compact 后的压缩列表：作为后续 run_turn 的发送底稿（SQLite 全量历史不动）

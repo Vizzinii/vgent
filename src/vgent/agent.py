@@ -4,7 +4,8 @@ M1：store + llm 接线。M2：接入 tools / permission，成为完整工具循
 chat → tool_calls → 权限确认（契约③）→ 执行（契约⑤）→ 结果写回 → 再 chat，
 直到模型不再调工具。M3：接入 ContextEngine（契约①②⑤）。
 M6：任务计划（plan 消息化）+ 显式 AgentState——每轮解析模型输出的
-[vgent-plan] 块并落库，状态转场随轮次持久化。
+[vgent-plan] 块并落库；状态转场在内存维护，每轮结束把最终态落库（中间态不落，
+见 state.py 注释口径）。
 """
 from __future__ import annotations
 
@@ -153,7 +154,8 @@ def run_turn(
     on_delta：流式文本增量（契约④，CLI 渲染）；on_tool：每次工具执行后的
     (工具名, 结果摘要) 回调（CLI 显示状态行）；on_reasoning：思考过程分片（M5）。
     M6：无计划时注入规划提示（不落库），解析模型输出的 [vgent-plan] 块并落库；
-    状态转场（PLANNING/EXECUTING/WAITING_PERMISSION/COMPLETED/FAILED）随轮次持久化。
+    状态转场（PLANNING/EXECUTING/WAITING_PERMISSION 等）在内存维护，
+    每轮结束把最终态（COMPLETED/FAILED）落库；中间态不落库（state.py 口径）。
     """
     msgs = ctx.store.get_history(ctx.session_id)
     first_turn = not msgs
@@ -325,8 +327,10 @@ def run_turn(
         final = ctx.llm.chat(list(msgs), tools=None, on_delta=on_delta, on_reasoning=on_reasoning)
         ctx.engine.update_from_response(final.usage)
         ctx.store.add_messages(ctx.session_id, final.messages)
+        msgs.extend(final.messages)  # 复审跟进：记忆摘要/管线切片需要收尾回复（与正常路径对齐）
         ctx.state = AgentState.COMPLETED
         _persist_state(ctx)
+        _maybe_auto_memory(ctx, msgs)  # 评审 F10：与正常退出路径对齐（此前漏调）
         _maybe_submit_memory_round(ctx, msgs)  # M12-C：超限收尾也算完整一轮
         return final
     except Exception:

@@ -358,7 +358,7 @@ def test_print_flag_parse() -> None:
 
 
 def test_run_headless_prints_and_persists(tmp_path, monkeypatch) -> None:
-    """P8：无头跑一轮 → 流式输出到 stdout、会话落库、exit 0。"""
+    """P8：无头跑一轮 → 流式输出到 stdout、exit 0；一次性会话跑完即清（评审 F12）。"""
     import io
 
     from vgent.cli import _run_headless
@@ -377,9 +377,7 @@ def test_run_headless_prints_and_persists(tmp_path, monkeypatch) -> None:
     code = _run_headless(Config(data_dir=tmp_path), store, "问题", Console(file=buf))
     assert code == 0
     assert "流式内容" in buf.getvalue()
-    sessions = store.list_sessions()
-    assert len(sessions) == 1
-    assert [m.role for m in store.get_history(sessions[0].id)] == ["user", "assistant"]
+    assert store.list_sessions() == []  # F12：headless 会话不残留
     store.close()
 
 
@@ -406,17 +404,20 @@ def test_run_headless_rejects_exec_tool(tmp_path, monkeypatch) -> None:
     class Scripted:
         def __init__(self) -> None:
             self.rs = list(responses)
+            self.calls: list = []
 
         def chat(self, messages, tools=None, on_delta=None, on_reasoning=None):
+            self.calls.append(list(messages))
             return self.rs.pop(0)
 
-    monkeypatch.setattr("vgent.cli.LLMClient", lambda cfg: Scripted())
+    scripted = Scripted()
+    monkeypatch.setattr("vgent.cli.LLMClient", lambda cfg: scripted)
     store = _store(tmp_path)
     buf = io.StringIO()
     code = _run_headless(Config(data_dir=tmp_path), store, "删掉 x", Console(file=buf))
     assert code == 0
-    hist = store.get_history(store.list_sessions()[0].id)
-    tool_msgs = [m for m in hist if m.role == "tool"]
+    # F12 后 headless 会话跑完即删——拒绝回喂从第二次 chat 的入参里验证
+    tool_msgs = [m for m in scripted.calls[1] if m.role == "tool"]
     assert any("拒绝" in m.content for m in tool_msgs)
     store.close()
 
