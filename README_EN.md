@@ -192,7 +192,7 @@ v2 modules: `task.py` (task planning), `state.py` (state machine), `reflection.p
 ## Development
 
 ```bash
-uv run pytest           # tests (415)
+uv run pytest           # tests (502)
 uv run ruff check .     # lint
 ```
 

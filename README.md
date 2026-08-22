@@ -192,7 +192,7 @@ v2 演进模块：`task.py`（任务计划）、`state.py`（状态机）、`ref
 ## 开发
 
 ```bash
-uv run pytest           # 测试（415 例）
+uv run pytest           # 测试（502 例）
 uv run ruff check .     # lint
 ```
 

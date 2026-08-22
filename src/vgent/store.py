@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -16,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from vgent.messages import Message, ToolCall
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -141,8 +144,8 @@ class SessionStore:
 
     # -- 消息 ---------------------------------------------------------------
 
-    @_locked
-    def add_message(self, session_id: str, msg: Message) -> None:
+    def _insert_message(self, session_id: str, msg: Message) -> None:
+        """单条 INSERT（不 commit）——add_message / add_messages 共用（V3）。"""
         self._conn.execute(
             "INSERT INTO messages "
             "(session_id, role, content, reasoning_content, tool_calls, tool_call_id, ts) "
@@ -157,12 +160,18 @@ class SessionStore:
                 _now(),
             ),
         )
+
+    @_locked
+    def add_message(self, session_id: str, msg: Message) -> None:
+        self._insert_message(session_id, msg)
         self._conn.commit()
 
     @_locked
     def add_messages(self, session_id: str, msgs: list[Message]) -> None:
-        for m in msgs:
-            self.add_message(session_id, m)
+        """批量写入（V3 修复）：单事务——中途失败整体回滚，不落半批。"""
+        with self._conn:  # 正常提交、异常回滚
+            for m in msgs:
+                self._insert_message(session_id, m)
 
     @_locked
     def get_history(self, session_id: str) -> list[Message]:
@@ -260,7 +269,14 @@ class SessionStore:
         ).fetchone()
         if row is None:
             return None
-        return row[0], _messages_from_json(row[1]), int(row[2])
+        try:
+            return row[0], _messages_from_json(row[1]), int(row[2])
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+            # V1 修复：坏 JSON 容错——DB 被外部编辑/磁盘损坏时退回全量历史，不打死会话
+            _LOGGER.warning(
+                "session_compacts.retained 损坏，忽略该压缩记录（session=%s）", session_id
+            )
+            return None
 
     @_locked
     def get_history_after(self, session_id: str, message_id: int) -> list[Message]:
@@ -291,8 +307,13 @@ def _tool_calls_to_json(calls: list[ToolCall] | None) -> str | None:
 def _tool_calls_from_json(raw: str | None) -> list[ToolCall] | None:
     if not raw:
         return None
-    data = json.loads(raw)
-    return [ToolCall(d["id"], d["name"], d.get("arguments", "")) for d in data]
+    try:
+        data = json.loads(raw)
+        return [ToolCall(d["id"], d["name"], d.get("arguments", "")) for d in data]
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+        # V1 同类加固：坏 tool_calls JSON 降级为无 tool_calls 的普通消息（不崩、不丢整段历史）
+        _LOGGER.warning("messages.tool_calls 损坏，该消息降级为无 tool_calls")
+        return None
 
 
 def _messages_to_json(msgs: list[Message]) -> str:

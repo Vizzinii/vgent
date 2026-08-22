@@ -262,7 +262,9 @@ def run_turn(
                 send, model=llm_model, fixed_extra=_tools_schema_json(ctx.tools)
             ):
                 before = msgs
-                msgs = ctx.engine.compress(msgs)
+                # V2 修复：force=True——触发条件已由估算口径（tiktoken + schema + 预留）验证，
+                # 跳过 compress 内部异口径的启发式二次门（中文 len//3 低估时估算路径静默失效）
+                msgs = ctx.engine.compress(msgs, force=True)
                 _persist_compacted(ctx, before, msgs)
                 send = _send_with_anchors(
                     msgs,

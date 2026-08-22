@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+from conftest import FakeLLM, ScriptedLLM, _chat_final, _chat_with_tools
 
 from vgent.agent import SessionContext, run_turn
 from vgent.config import ContextConfig
@@ -13,47 +14,6 @@ from vgent.permission import ConfirmResult, PermissionSystem
 from vgent.state import AgentState
 from vgent.store import SessionStore
 from vgent.tools import ToolRegistry, ToolSchema
-
-
-class FakeLLM:
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-
-    def chat(self, messages, tools=None, on_delta=None, on_reasoning=None):
-        self.calls.append(messages)
-        if on_delta:
-            on_delta("你好")
-        return ChatResult(
-            messages=[Message("assistant", "你好")],
-            usage=Usage(10, 5, 15),
-        )
-
-
-class ScriptedLLM:
-    """按顺序返回预设响应的假 LLM。"""
-
-    def __init__(self, responses: list[ChatResult]) -> None:
-        self.responses = list(responses)
-        self.calls: list[list[Message]] = []
-
-    def chat(self, messages, tools=None, on_delta=None, on_reasoning=None):
-        self.calls.append(messages)
-        r = self.responses.pop(0)
-        if on_delta and r.messages and r.messages[0].content:
-            on_delta(r.messages[0].content)
-        return r
-
-
-def _chat_with_tools(tc: ToolCall, content: str = "") -> ChatResult:
-    return ChatResult(
-        messages=[Message("assistant", content, tool_calls=[tc])],
-        usage=Usage(10, 5, 15),
-        tool_calls=[tc],
-    )
-
-
-def _chat_final(content: str) -> ChatResult:
-    return ChatResult(messages=[Message("assistant", content)], usage=Usage(20, 5, 25))
 
 
 def test_run_turn_persists_and_returns(tmp_path) -> None:
