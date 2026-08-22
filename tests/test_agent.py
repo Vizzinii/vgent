@@ -245,7 +245,7 @@ def test_run_turn_prunes_old_tool_results(tmp_path) -> None:
         content = "line\n" + "y" * 2000 if i == 0 else "ok"
         store.add_message(sid, Message("tool", content, tool_call_id=f"c{i}"))
     engine = ContextEngine(
-        context_length=1000,
+        context_length=10000,  # M12：窗口放大，tiktoken 估算下仍只剪枝不压缩（水位 9000 > 估算）
         cfg=ContextConfig(prune_percent=0.05, threshold_percent=0.9, tail_token_budget=100),
     )
     llm = FakeLLM()
@@ -772,3 +772,52 @@ def test_user_instructions_not_injected_second_turn(tmp_path) -> None:
     run_turn("任务一", ctx)
     run_turn("任务二", ctx)
     assert not any(m.content.startswith("用户指令") for m in llm.calls[1])
+
+
+# -- M12：上下文预算精确化 + compact 持久化 ---------------------------------------
+
+
+def test_run_turn_rebuilds_compacted_base_from_store(tmp_path) -> None:
+    """M12：会话有压缩记录 → run_turn 以 头部+摘要+保留尾部+边界后消息 为底稿（不发全量）。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    for i in range(6):
+        store.add_message(sid, Message("user", f"m{i}"))  # ids 1..6
+    # 模拟 /compact：摘要 + 保留尾部（m4、m5），边界 = 最后保留消息 id（6）
+    store.upsert_compact(sid, "【历史摘要】要点", [Message("user", "m4"), Message("user", "m5")], 6)
+    store.add_message(sid, Message("assistant", "后续回复"))  # id 7
+    llm = FakeLLM()
+    ctx = SessionContext(session_id=sid, store=store, llm=llm)
+    run_turn("继续", ctx)
+    sent = llm.calls[0]
+    contents = [m.content for m in sent]
+    assert "m0" in contents  # 头部保留
+    assert any("历史摘要" in c for c in contents)  # 摘要消息
+    assert "m4" in contents and "m5" in contents  # 保留尾部
+    assert "后续回复" in contents  # 边界后的新增消息
+    assert "m1" not in contents and "m2" not in contents and "m3" not in contents  # 中间被压缩
+    assert sent[-1].content == "继续"
+    store.close()
+
+
+def test_auto_compress_persists_compact_record(tmp_path) -> None:
+    """M12：run_turn 内压缩触发 → 压缩记录落库（messages 表全量不动）。"""
+    store = SessionStore(tmp_path / "t.db")
+    sid = store.create_session()
+    for _ in range(20):
+        store.add_message(sid, Message("user", "x" * 40))
+        store.add_message(sid, Message("assistant", "y" * 40))
+    engine = ContextEngine(
+        context_length=1000,
+        cfg=ContextConfig(prune_percent=0.01, threshold_percent=0.1, tail_token_budget=60),
+    )
+    llm = FakeLLM()
+    ctx = SessionContext(session_id=sid, store=store, llm=llm, engine=engine)
+    run_turn("再来", ctx)
+    comp = store.get_compact(sid)
+    assert comp is not None
+    summary, retained, _boundary = comp
+    assert summary and "TailWindow" in summary
+    assert retained  # 保留尾部非空
+    assert len(store.get_history(sid)) == 42  # messages 表全量不动（压缩记录在独立表）
+    store.close()

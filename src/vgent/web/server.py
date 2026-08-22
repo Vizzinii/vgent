@@ -31,9 +31,13 @@ from vgent.config import Config
 from vgent.context import COMPACT_PROMPT, ContextEngine, extract_summary_with_fallback
 from vgent.llm import ChatResult, LLMClient
 from vgent.mcp import load_into_registry
-from vgent.memory.episodic import EpisodicMemory, summarize
+from vgent.memory.episodic import EpisodicMemory, memory_note_text, summarize
+from vgent.memory.pipeline import MemoryPipeline
+from vgent.memory.store import MemoryFileStore
+from vgent.memory.tools import make_memory_tools
 from vgent.messages import Message
 from vgent.permission import ConfirmResult, PermissionSystem, persist_allow
+from vgent.snapshot import SnapshotStore
 from vgent.store import SessionStore
 from vgent.task import plan_from_messages
 from vgent.tools import ToolRegistry, default_tools
@@ -52,6 +56,9 @@ COMMAND_HELP = """命令：
   /remember <主题> 记住当前会话（LLM 摘要存本机）
   /recall <关键词> 检索历史记忆并注入上下文
   /memories        列出已记住的任务摘要
+  /memory          项目长期记忆（/memory show|path|grep <词>|clear，见 /memory help）
+  /snapshot [名]   把本会话改过的文件拍成命名档（无名用时间戳）
+  /restore         列出可恢复的快照（/restore last|编号|名|undo；只撤文件不动对话）
   /mcp             列出已加载的 MCP 工具
   /help            显示帮助
 """
@@ -181,8 +188,24 @@ class HubManager:
         self.llm = llm or LLMClient(cfg)
         self.tools = tools or default_tools()
         self.mcp_loaded = load_into_registry(self.tools, cfg.mcp_servers)
+        for t in make_memory_tools(cfg.data_dir, Path(os.getcwd())):  # M12-C：记忆检索工具
+            self.tools.register(t.schema, t.handler)
         self.tools.filter_denied(cfg.permissions.deny)  # P10：deny 工具裁剪
         self.memory = EpisodicMemory(cfg.data_dir / "memory" / "episodic.jsonl")
+        # M12-C：项目级记忆（summary 注入 + memory_auto 时自动两阶段管线，独立 client）
+        self.memory_store = MemoryFileStore(cfg.data_dir, Path(os.getcwd()))
+        self.memory_pipeline: MemoryPipeline | None = None
+        if cfg.memory_auto:
+            self.memory_pipeline = MemoryPipeline(
+                self.memory_store,
+                LLMClient(cfg),  # R3：管线不调 ctx.llm
+                cfg.provider.light_model or cfg.provider.model,
+            )
+        self.memory_summary = (
+            self.memory_store.read_summary()
+            if not self.memory_store.summary_is_placeholder()
+            else None
+        )
         found = find_instructions(os.getcwd())
         self.instructions = found[1] if found else None
         self.instructions_name = found[0] if found else None
@@ -217,6 +240,12 @@ class HubManager:
                     instructions_name=self.instructions_name,
                     user_instructions=self.user_instructions,  # P6
                     data_dir=self.cfg.data_dir,  # P2：/allow 持久化
+                    snapshots=SnapshotStore(  # M12-B：快照/恢复（每会话独立目录）
+                        self.cfg.data_dir / "checkpoints" / sid, Path(os.getcwd())
+                    ),
+                    memory_file_store=self.memory_store,  # M12-C
+                    memory_pipeline=self.memory_pipeline,  # M12-C
+                    memory_summary=self.memory_summary,  # M12-C
                 )
                 hub = SessionHub(ctx)
                 ctx.permissions = PermissionSystem(confirm=hub.confirm, rules=self.cfg.permissions)  # P2
@@ -245,6 +274,8 @@ def run_command(text: str, hub: SessionHub) -> str:
         return _cmd_plan(hub, redo=("new" in text or "redo" in text))
     if text == "/memories" or text == "/remember":
         return _cmd_memories(hub)
+    if text == "/memory" or text.startswith("/memory "):  # M12-C
+        return _cmd_memory(hub, text[len("/memory ") :].strip() if text != "/memory" else "")
     if text.startswith("/remember "):
         return _cmd_remember(hub, text[len("/remember ") :].strip())
     if text.startswith("/recall "):
@@ -253,6 +284,10 @@ def run_command(text: str, hub: SessionHub) -> str:
         return _cmd_mcp(hub)
     if text == "/allow" or text.startswith("/allow "):
         return _cmd_allow(hub, text[len("/allow ") :].strip() if text != "/allow" else "")
+    if text == "/snapshot" or text.startswith("/snapshot "):  # M12-B
+        return _cmd_snapshot(hub, text[len("/snapshot ") :].strip() if text != "/snapshot" else "")
+    if text == "/restore" or text.startswith("/restore "):  # M12-B
+        return _cmd_restore(hub, text[len("/restore ") :].strip() if text != "/restore" else "")
     return f"未知命令：{text}（/help 查看）"
 
 
@@ -283,7 +318,57 @@ def _cmd_compact(hub: SessionHub) -> str:
     if compacted is msgs:
         return "没有可压缩的内容（历史已在保护范围内）。"
     ctx.engine.compacted = compacted
+    # M12：压缩结果落库，恢复会话后仍以压缩底稿续聊（不发全量历史）
+    if len(compacted) >= 2 and compacted[1].role == "system" and compacted[1].content:
+        boundary = ctx.store.last_message_id(ctx.session_id)
+        if boundary is not None:
+            ctx.store.upsert_compact(
+                ctx.session_id, compacted[1].content, list(compacted[2:]), boundary
+            )
     return f"已压缩：{len(msgs)} 条 → {len(compacted)} 条（对后续对话生效）"
+
+
+def _cmd_snapshot(hub: SessionHub, name: str) -> str:
+    """M12-B：/snapshot —— 把本会话改过的文件拍成命名档。"""
+    ctx = hub.ctx
+    if ctx.snapshots is None:
+        return "快照未启用。"
+    try:
+        final = ctx.snapshots.save_named(name or None)
+    except ValueError as exc:
+        return f"快照创建失败：{exc}"
+    return f"已创建命名快照 {final}"
+
+
+def _cmd_restore(hub: SessionHub, arg: str) -> str:
+    """M12-B：/restore —— 无参列出；last|编号|名|undo 恢复（Web 无交互，直接执行）。"""
+    ctx = hub.ctx
+    if ctx.snapshots is None:
+        return "快照未启用。"
+    if not arg:
+        entries = ctx.snapshots.list_entries()
+        if not entries:
+            return "没有可恢复的快照（write/edit 改过文件后每回合自动记录）。"
+        lines = ["可恢复的快照："]
+        for e in entries:
+            files = ", ".join(e["files"][:5]) + (" …" if len(e["files"]) > 5 else "")
+            lines.append(
+                f"  {e['key']}: {e['label']}（{e['ts'][:16]}，"
+                f"{len(e['files'])} 个文件：{files}）"
+            )
+        return "\n".join(lines)
+    try:
+        if arg == "last":
+            report = ctx.snapshots.restore_last()
+        elif arg == "undo":
+            report = ctx.snapshots.restore_undo()
+        elif arg.isdigit():
+            report = ctx.snapshots.restore_index(int(arg))
+        else:
+            report = ctx.snapshots.restore_named(arg)
+    except (ValueError, FileNotFoundError) as exc:
+        return f"恢复失败：{exc}"
+    return report.format()
 
 
 def _cmd_plan(hub: SessionHub, redo: bool) -> str:
@@ -331,7 +416,7 @@ def _cmd_recall(hub: SessionHub, keyword: str) -> str:
     for e in hits:
         ctx.store.add_message(
             ctx.session_id,
-            Message("system", f"[记忆] {e.topic}（{e.ts[:10]}）：{e.summary}"),
+            Message("system", memory_note_text(e)),  # M12-C：>1 天附新鲜度警告
         )
     return f"已注入 {len(hits)} 条记忆（后续对话可见）。"
 
@@ -348,6 +433,43 @@ def _cmd_memories(hub: SessionHub) -> str:
         first = e.summary.splitlines()[0] if e.summary else ""
         lines.append(f"  {e.ts[:16]} [{e.topic}] {first[:60]}")
     return "\n".join(lines)
+
+
+def _cmd_memory(hub: SessionHub, arg: str) -> str:
+    """M12-C：/memory —— 项目级长期记忆（与 cli._memory_inline 同语义，返回文本）。"""
+    store = hub.ctx.memory_file_store
+    if store is None:
+        return "记忆存储未启用。"
+    if not arg:
+        if store.summary_is_placeholder():
+            summary_line = "（尚无浓缩摘要）"
+        else:
+            first = store.read_summary().splitlines()
+            summary_line = (first[0] if first else "")[:80]
+        state = (
+            f"管线：运行中（队列 {hub.ctx.memory_pipeline.pending_count}，待合并 "
+            f"{hub.ctx.memory_pipeline.pending_signal_count}）"
+            if hub.ctx.memory_pipeline is not None
+            else "管线：未启用（memory_auto=false）"
+        )
+        return f"项目长期记忆：{summary_line}\n{state}\n/memory show 看全文"
+    if arg == "show":
+        return store.read_summary(limit=None)
+    if arg == "path":
+        return str(store.root)
+    if arg == "help":
+        return "用法：/memory（总览）| /memory show | /memory path | /memory grep <词> | /memory clear"
+    if arg == "clear":
+        if hub.ctx.memory_pipeline is not None:
+            hub.ctx.memory_pipeline.invalidate()
+        store.clear()
+        return "已清空本项目长期记忆（episodic 条目不受影响）。"
+    if arg.startswith("grep "):
+        query = arg[len("grep ") :].strip()
+        if not query:
+            return "用法：/memory grep <词>（空格分隔 AND）"
+        return store.grep(query)
+    return f"未知子命令：{arg}（/memory help 查看用法）"
 
 
 def _cmd_mcp(hub: SessionHub) -> str:
@@ -576,6 +698,7 @@ def make_server(manager: HubManager, port: int = 0, host: str = "127.0.0.1") -> 
 def serve(cfg: Config, port: int = DEFAULT_PORT, open_browser: bool = True) -> int:
     """`vgent --serve` 入口：接线 + 起服务 + 自动开浏览器。"""
     store = SessionStore(cfg.data_dir / "sessions" / "vgent.db")
+    SnapshotStore.cleanup_old(cfg.data_dir / "checkpoints")  # M12-B：超期快照目录清理
     manager = HubManager(cfg, store)
     httpd = make_server(manager, port=port)
     url = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -590,6 +713,8 @@ def serve(cfg: Config, port: int = DEFAULT_PORT, open_browser: bool = True) -> i
     except KeyboardInterrupt:
         print("\n已停止。")
     finally:
+        if manager.memory_pipeline is not None:  # M12-C：停止前排空记忆队列
+            manager.memory_pipeline.drain()
         httpd.server_close()
         store.close()
     return 0

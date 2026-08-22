@@ -11,6 +11,7 @@ dependencies = [
     "openai>=1.40",
     "prompt-toolkit>=3.0",
     "rich>=13.7",
+    "tiktoken>=0.14.0",
 ]
 
 [project.scripts]

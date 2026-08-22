@@ -16,10 +16,13 @@ from pathlib import Path
 
 from vgent.context import ContextEngine
 from vgent.llm import ChatResult, LLMClient
-from vgent.memory.episodic import EpisodicMemory, current_project, summarize
+from vgent.memory.episodic import EpisodicMemory, current_project, memory_note_text, summarize
+from vgent.memory.pipeline import MemoryPipeline, should_extract, slice_round
+from vgent.memory.store import MemoryFileStore
 from vgent.messages import Message, ToolCall
 from vgent.permission import Approval, ConfirmResult, PermissionSystem
 from vgent.reflection import MAX_REFLECT_ROUNDS, looks_failed, reflect
+from vgent.snapshot import SnapshotStore
 from vgent.state import AgentState
 from vgent.store import SessionStore
 from vgent.task import PLAN_HINT, TaskPlan, plan_from_messages
@@ -34,6 +37,83 @@ def _session_title(text: str) -> str:
     if len(line) > 24:
         return line[:23] + "…"
     return line or "新会话"
+
+
+def _send_with_anchors(
+    msgs: list[Message],
+    *,
+    cwd_anchor: Message | None,
+    instruction_anchors: list[Message],
+    hint: Message | None,
+    plan_nudge: Message | None,
+    reflection_note: Message | None,
+    memory_notes: list[Message] | None,
+    memory_summary: Message | None = None,
+) -> list[Message]:
+    """M12：组装发送列表（锚点顺序与原 inline 逻辑一致，供估算触发压缩后重建复用）。
+
+    memory_summary：M12-C 项目级记忆总览（每轮注入，非一次性；None 时跳过）。
+    """
+    send = list(msgs)
+    if memory_summary is not None:
+        send.insert(0, memory_summary)
+    if cwd_anchor is not None:
+        send.insert(0, cwd_anchor)
+    if instruction_anchors:
+        send = instruction_anchors + send
+    if hint is not None:
+        send.insert(0, hint)
+    if plan_nudge is not None:
+        send.insert(0, plan_nudge)
+    if reflection_note is not None:
+        send.insert(0, reflection_note)
+    if memory_notes is not None:
+        send = memory_notes + send
+    return send
+
+
+def _tools_schema_json(registry: ToolRegistry) -> str | None:
+    """M12：tools schema 的固定开销文本（估算时计入；无工具则 None）。"""
+    schemas = registry.schemas()
+    if not schemas:
+        return None
+    return json.dumps(schemas, ensure_ascii=False)
+
+
+def _persist_compacted(
+    ctx: SessionContext, before: list[Message], after: list[Message]
+) -> None:
+    """M12：压缩实际发生时把摘要 + 保留尾部 + 边界落库，供恢复会话重建发送底稿。
+
+    after = [头部, 摘要/标记消息, *保留尾部]；边界 = 压缩时刻的最后消息 id，
+    之后新增的消息由 get_history_after 续接（尾部消息与 messages 表同源，不重复）。
+    """
+    if after is before or len(after) < 2:
+        return
+    marker = after[1]
+    if marker.role != "system" or not marker.content:
+        return
+    boundary = ctx.store.last_message_id(ctx.session_id)
+    if boundary is None:
+        return
+    ctx.store.upsert_compact(ctx.session_id, marker.content, list(after[2:]), boundary)
+
+
+def _compacted_from_store(ctx: SessionContext) -> list[Message] | None:
+    """M12：从 SQLite 压缩记录重建发送底稿（恢复会话后不发全量历史）。
+
+    底稿 = [头部, 摘要, *保留尾部, *边界之后的新消息]——与压缩时刻的内存视图一致。
+    """
+    comp = ctx.store.get_compact(ctx.session_id)
+    if comp is None:
+        return None
+    summary, retained, boundary = comp
+    history = ctx.store.get_history(ctx.session_id)
+    after = ctx.store.get_history_after(ctx.session_id, boundary)
+    base: list[Message] = [Message("system", summary), *retained, *after]
+    if history:
+        base.insert(0, history[0])
+    return base
 
 
 @dataclass
@@ -55,6 +135,10 @@ class SessionContext:
     user_instructions: str | None = None  # P6：用户级指令（~/.vgent/AGENTS.md）
     ext_commands: dict[str, Callable] = field(default_factory=dict)  # M10：外部命令 {name: run(ctx, args)}
     data_dir: Path | None = None  # P2：/allow 持久化到 config.toml 用（cli/web 注入）
+    snapshots: SnapshotStore | None = None  # M12-B：快照/恢复（cli/web 注入；None 时全路径 no-op）
+    memory_file_store: MemoryFileStore | None = None  # M12-C：记忆文件存储（/memory 命令用）
+    memory_pipeline: MemoryPipeline | None = None  # M12-C：自动两阶段记忆管线（memory_auto 时注入）
+    memory_summary: str | None = None  # M12-C：项目级记忆总览（MemoryFileStore.read_summary，每轮注入）
 
 
 def run_turn(
@@ -77,8 +161,18 @@ def run_turn(
         # M4：首条用户消息自动生成会话标题（gemini-cli/openclaw 惯例）
         ctx.store.update_title(ctx.session_id, _session_title(user_input))
     # M4：/compact 后的压缩列表作为发送底稿（只影响发送列表，SQLite 全量历史不动）
+    # M12：进程内无底稿时从 SQLite 压缩记录重建（恢复会话后不发全量历史）
+    # 底稿一次一清（评审 F1）：消费后置 None，下轮走 _compacted_from_store 重建
+    # （含压缩边界之后的新消息）——否则同进程 /compact 后续回合永远拿旧快照，丢中间轮。
     if ctx.engine.compacted is not None:
         msgs = list(ctx.engine.compacted)
+        ctx.engine.compacted = None
+    elif (rebuilt := _compacted_from_store(ctx)) is not None:
+        msgs = list(rebuilt)
+    # M12 中断修复：Ctrl-C 落在「assistant(tool_calls) 已落库、工具结果未落库」的窗口
+    # 会在库里留下孤儿 tool_calls——发送前清洗（SQLite 全量历史不动，只修发送列表），
+    # 防止恢复会话后 API 因「tool_calls 无对应 tool 响应」返回 400。
+    msgs = ContextEngine._cleanup_tool_pairs(msgs)
     msgs.append(Message(role="user", content=user_input))
     ctx.store.add_message(ctx.session_id, msgs[-1])
 
@@ -109,7 +203,7 @@ def run_turn(
             )
         )
     # M8：自动回忆——用户消息命中已存记忆主题 → 注入 [记忆]（不落库，一次性）
-    # P5：只搜当前项目（防跨项目串味）
+    # P5：只搜当前项目（防跨项目串味）；M12-C：>1 天条目附新鲜度警告
     memory_notes: list[Message] | None = None
     if ctx.memory is not None:
         hits = [
@@ -117,33 +211,72 @@ def run_turn(
             if not _memory_already_present(msgs, e.topic)
         ]
         if hits:
-            memory_notes = [
-                Message("system", f"[记忆] {e.topic}（{e.ts[:10]}）：{e.summary}") for e in hits
-            ]
+            memory_notes = [Message("system", memory_note_text(e)) for e in hits]
+
+    # M12-C：项目级记忆总览（memory_summary.md 截断），每轮注入（非一次性）
+    # 每轮从文件重读（评审 F4）：管线 stage2 会重写 summary，启动时读的快照会陈旧；
+    # 无 memory_file_store 时退回 ctx.memory_summary 直填（测试桩口径，R4）
+    if ctx.memory_file_store is not None:
+        summary = ctx.memory_file_store.read_summary()
+        ctx.memory_summary = (
+            None if ctx.memory_file_store.summary_is_placeholder() else summary
+        )
+    memory_summary_note: Message | None = None
+    if ctx.memory_summary:
+        memory_summary_note = Message("system", f"[记忆总览]\n{ctx.memory_summary}")
+
+    # M12：发送前估算用的模型名（测试桩 FakeLLM 无 cfg 时回退 None → cl100k_base）
+    _provider = getattr(getattr(ctx.llm, "cfg", None), "provider", None)
+    llm_model = getattr(_provider, "model", None) if _provider is not None else None
+
+    # M12-B：回合快照（写盘前登记、回合末封存；快照是辅助功能，失败静默不阻断对话）
+    if ctx.snapshots is not None:
+        try:
+            ctx.snapshots.begin_turn()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
     try:
         for _ in range(MAX_TOOL_ROUNDS):
             # M3 上下文引擎（只动发送列表，SQLite 全量历史不动）：
             msgs, _ = ctx.engine.prune_tool_results_only(msgs)  # 契约⑤ 低水位
-            if ctx.engine.should_compress():  # 契约② 高水位
+            if ctx.engine.should_compress():  # 契约② 高水位（usage 校准）
+                before = msgs
                 msgs = ctx.engine.compress(msgs)
-            send = list(msgs)
-            if cwd_anchor is not None:  # 工作目录锚点：只注入首个 LLM 调用
-                send.insert(0, cwd_anchor)
-                cwd_anchor = None
-            if instruction_anchors:  # P6/M10：指令：只注入首个 LLM 调用
-                send = instruction_anchors + send
-                instruction_anchors = []
-            if hint is not None:  # M6：无计划时注入规划提示（不落库）
-                send.insert(0, hint)
-            if plan_nudge is not None:  # M6：有工具执行 → 轻推同步计划状态
-                send.insert(0, plan_nudge)
-            if reflection_note is not None:  # M7：上轮失败 → 注入反思修正动作
-                send.insert(0, reflection_note)
-                reflection_note = None
-            if memory_notes is not None:  # M8：历史记忆一次性注入（不落库）
-                send = memory_notes + send
-                memory_notes = None
+                _persist_compacted(ctx, before, msgs)  # M12：压缩结果落库
+            send = _send_with_anchors(
+                msgs,
+                cwd_anchor=cwd_anchor,
+                instruction_anchors=instruction_anchors,
+                hint=hint,
+                plan_nudge=plan_nudge,
+                reflection_note=reflection_note,
+                memory_notes=memory_notes,
+                memory_summary=memory_summary_note,
+            )
+            # M12：发送前 tiktoken 精确估算（含 tools schema 固定开销 + 预留输出），
+            # 与 usage 校准并列——弥补「只按 API usage 触发」看不到的 system/tools 开销
+            if ctx.engine.should_compress_estimated(
+                send, model=llm_model, fixed_extra=_tools_schema_json(ctx.tools)
+            ):
+                before = msgs
+                msgs = ctx.engine.compress(msgs)
+                _persist_compacted(ctx, before, msgs)
+                send = _send_with_anchors(
+                    msgs,
+                    cwd_anchor=cwd_anchor,
+                    instruction_anchors=instruction_anchors,
+                    hint=hint,
+                    plan_nudge=plan_nudge,
+                    reflection_note=reflection_note,
+                    memory_notes=memory_notes,
+                    memory_summary=memory_summary_note,
+                )
+            # 消费一次性锚点（首轮注入后失效；hint/plan_nudge 每轮重置语义不变）
+            cwd_anchor = None
+            instruction_anchors = []
+            reflection_note = None
+            memory_notes = None
             # 传快照：LLM 客户端（或测试桩）可能持有该列表，后续 extend 不应污染它
             result = ctx.llm.chat(
                 send, tools=ctx.tools.schemas(), on_delta=on_delta, on_reasoning=on_reasoning
@@ -165,6 +298,7 @@ def run_turn(
                 ctx.state = AgentState.COMPLETED
                 _persist_state(ctx)
                 _maybe_auto_memory(ctx, msgs)  # M8：计划完成 → 自动存摘要（可配置）
+                _maybe_submit_memory_round(ctx, msgs)  # M12-C：本轮切片入管线（非阻塞）
                 return result
             failed_any = False
             for tc in result.tool_calls:
@@ -193,11 +327,19 @@ def run_turn(
         ctx.store.add_messages(ctx.session_id, final.messages)
         ctx.state = AgentState.COMPLETED
         _persist_state(ctx)
+        _maybe_submit_memory_round(ctx, msgs)  # M12-C：超限收尾也算完整一轮
         return final
     except Exception:
         ctx.state = AgentState.FAILED
         _persist_state(ctx)
         raise
+    finally:
+        # M12-B：回合末封存快照（异常路径也封存；失败静默不覆盖原异常）
+        if ctx.snapshots is not None:
+            try:
+                ctx.snapshots.seal_turn()
+            except Exception:  # noqa: BLE001, S110
+                pass
 
 
 def _finalize_plan(ctx: SessionContext, msgs: list[Message]) -> None:
@@ -251,6 +393,19 @@ def _maybe_auto_memory(ctx: SessionContext, msgs: list[Message]) -> None:
         ctx.memory.add(title, summary, ctx.session_id, title)
 
 
+def _maybe_submit_memory_round(ctx: SessionContext, msgs: list[Message]) -> None:
+    """M12-C：本轮对话切片提交给记忆管线（非阻塞、不写 store、不调 ctx.llm，R3）。
+
+    管线未注入（默认 None）或本轮不值得抽取时全路径 no-op——现有 run_turn
+    测试的 llm.calls 精确断言与消息序列断言不受影响。
+    """
+    if ctx.memory_pipeline is None:
+        return
+    rc = slice_round(msgs, workspace=Path(os.getcwd()), session_id=ctx.session_id)
+    if should_extract(rc):
+        ctx.memory_pipeline.submit(rc)
+
+
 def _dispatch_tool(
     tc: ToolCall, ctx: SessionContext, on_tool: Callable[[str, str], None] | None
 ) -> Message:
@@ -273,6 +428,8 @@ def _dispatch_tool(
     elif approval is Approval.DENIED:
         return Message("tool", f"工具 {tc.name} 被权限系统拒绝", tool_call_id=tc.id)
 
+    _note_snapshot_before_write(ctx, tc.name, args)  # M12-B：写盘前登记快照
+
     try:
         out = ctx.tools.execute(tc.name, args)
     except Exception as exc:  # noqa: BLE001 — 工具异常也要回喂模型（决策 9：容忍并自纠正）
@@ -280,6 +437,31 @@ def _dispatch_tool(
     if on_tool:
         on_tool(tc.name, out)
     return Message("tool", out, tool_call_id=tc.id)
+
+
+def _note_snapshot_before_write(ctx: SessionContext, tool_name: str, args: dict) -> None:
+    """M12-B：write/edit 改盘前登记原文快照（相对 cwd posix；越界/失败跳过不阻断）。
+
+    放在 agent 派发层而非工具 handler 内——工具 handler 契约保持纯 `handler(args)`（R2）。
+    路径解析与 tools.py 同规则（相对路径基于 os.getcwd()）。
+    """
+    if ctx.snapshots is None or tool_name not in ("write_file", "edit_file"):
+        return
+    raw = str(args.get("path", "")).strip()
+    if not raw:
+        return
+    try:
+        p = Path(raw)
+        resolved = p.resolve(strict=False) if p.is_absolute() else (
+            Path(os.getcwd()) / p
+        ).resolve(strict=False)
+        rel = resolved.relative_to(Path(os.getcwd()).resolve()).as_posix()
+    except (OSError, ValueError):
+        return  # 越界/坏路径：快照不跟踪，工具照常执行
+    try:
+        ctx.snapshots.note_before_write(rel)
+    except Exception:  # noqa: BLE001, S110 — 快照失败不影响工具执行
+        pass
 
 
 def _safe_parse(arguments: str) -> tuple[dict | None, str | None]:

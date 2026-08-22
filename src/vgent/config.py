@@ -19,7 +19,7 @@ DEFAULT_CONFIG_PATH = DEFAULT_DATA_DIR / "config.toml"
 
 DEFAULT_PROVIDER = "deepseek"
 
-_PROVIDER_FIELDS = ("base_url", "api_key", "api_key_env", "model", "context_length")
+_PROVIDER_FIELDS = ("base_url", "api_key", "api_key_env", "model", "light_model", "context_length")
 
 
 @dataclass
@@ -29,6 +29,7 @@ class ProviderConfig:
     api_key: str = ""
     api_key_env: str = ""  # 该 provider 的环境变量名（优先级高于 api_key）；空 = 不用环境变量
     model: str = "deepseek-v4-flash"
+    light_model: str = ""  # M12：轻量模型（记忆抽取/压缩摘要等后台任务用）；空 = 用 model
     context_length: int = 1_000_000  # DeepSeek V4 Flash 1M（用户确认）
 
     def api_key_resolved(self) -> str:
@@ -44,6 +45,7 @@ class ContextConfig:
     prune_percent: float = 0.30  # 低水位：触发免费剪枝（1M 窗口主角）
     tail_token_budget: int = 20_000  # 压缩时尾部保留预算（hermes 默认 ~20K）
     compact_strategy: str = "tail"  # "tail" 零成本 | "summarize" LLM 摘要（M4；需注入 summarizer）
+    reserved_output_tokens: int = 0  # M12：发送前预留的模型输出 token；0 = 按窗口 5% 自动（1M→50k，claude 分级 buffer 思路）
 
 
 @dataclass

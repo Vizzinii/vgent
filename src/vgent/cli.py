@@ -32,10 +32,14 @@ from vgent.context import (
 )
 from vgent.llm import LLMClient
 from vgent.mcp import load_into_registry
-from vgent.memory.episodic import EpisodicMemory, summarize
+from vgent.memory.episodic import EpisodicMemory, memory_note_text, summarize
+from vgent.memory.pipeline import MemoryPipeline
+from vgent.memory.store import MemoryFileStore
+from vgent.memory.tools import make_memory_tools
 from vgent.messages import Message
 from vgent.permission import ConfirmResult, PermissionSystem, persist_allow
 from vgent.reflection import reflect
+from vgent.snapshot import RestoreReport, SnapshotStore
 from vgent.store import SessionStore
 from vgent.task import plan_from_messages
 from vgent.tools import ToolSchema, default_tools
@@ -52,11 +56,16 @@ HELP = """命令：
   /remember <主题> 记住当前会话（LLM 摘要存本机，供跨会话回忆）
   /recall <关键词> 检索历史记忆并注入上下文（写入会话）
   /memories       列出已记住的任务摘要
+  /memory [子命令] 项目长期记忆（无参=总览+管线状态；show/path/grep/clear，见下）
   /mcp            列出已加载的 MCP 工具
   /reasoning      切换思考过程展示（开/关，默认关）
   /allow <工具>   放行工具（本会话 sticky + 写入 config.toml 跨会话记住）
+  /snapshot [名]  把本会话改过的文件拍成命名档（无名用时间戳）
+  /restore        列出可恢复的快照（/restore last|编号|名|undo 恢复；只撤文件不动对话）
   /help           显示帮助
   /exit           退出
+/memory 子命令：/memory（总览+管线状态）| /memory show（summary 全文）| /memory path |
+  /memory grep <词>（MEMORY/rollout 搜索）| /memory clear（清空本项目记忆并作废在途写入）
 外部命令：~/.vgent/commands/<name>.py 定义 run(ctx, args)，用 /<name> 调用（/help 列出）
 """
 
@@ -73,9 +82,12 @@ _BUILTIN_COMMANDS = (
     "/remember",
     "/recall",
     "/memories",
+    "/memory",
     "/mcp",
     "/reasoning",
     "/allow",
+    "/snapshot",
+    "/restore",
     "/help",
     "/exit",
     "/quit",
@@ -354,6 +366,8 @@ def _run_headless(cfg: Config, store: SessionStore, query: str, console: Console
     llm = LLMClient(cfg)
     tools = default_tools()
     load_into_registry(tools, cfg.mcp_servers)
+    for t in make_memory_tools(cfg.data_dir, Path(os.getcwd())):  # M12-C：记忆检索工具
+        tools.register(t.schema, t.handler)
     tools.filter_denied(cfg.permissions.deny)  # P10
     engine = ContextEngine(cfg.provider.context_length, cfg.context)
     engine.summarizer = _make_summarizer(llm)
@@ -383,6 +397,17 @@ def _run_headless(cfg: Config, store: SessionStore, query: str, console: Console
     return 0
 
 
+def _make_snapshots(ctx: SessionContext) -> SnapshotStore | None:
+    """M12-B：按当前会话（重新）建快照 store；无数据目录时 None。
+
+    会话切换（/new、/resume）后调用以跟随新 session_id。
+    headless 一次性会话不注入（write 默认拒绝 + 避免垃圾目录），由调用方决定。
+    """
+    if ctx.data_dir is None:
+        return None
+    return SnapshotStore(ctx.data_dir / "checkpoints" / ctx.session_id, Path(os.getcwd()))
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # 兼容 `vgent serve` 写法（argparse 无子命令，转成 --serve）
@@ -399,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
 
     db_path = cfg.data_dir / "sessions" / "vgent.db"
     store = SessionStore(db_path)
+    SnapshotStore.cleanup_old(cfg.data_dir / "checkpoints")  # M12-B：超期快照目录清理
+    memory_pipeline: MemoryPipeline | None = None  # M12-C：退出时 drain
     try:
         code = _headless(store, args, console)
         if code is not None:
@@ -427,6 +454,8 @@ def main(argv: list[str] | None = None) -> int:
         llm = LLMClient(cfg)
         tools = default_tools()
         mcp_loaded = load_into_registry(tools, cfg.mcp_servers)  # M9：加载 MCP 工具
+        for t in make_memory_tools(cfg.data_dir, Path(os.getcwd())):  # M12-C：记忆检索工具
+            tools.register(t.schema, t.handler)
         tools.filter_denied(cfg.permissions.deny)  # P10：deny 工具从 schemas() 裁剪
         if cfg.mcp_servers:
             for server, names in mcp_loaded.items():
@@ -442,6 +471,17 @@ def main(argv: list[str] | None = None) -> int:
         ext_commands = load_commands(cfg.data_dir / "commands")  # M10：外部命令
         found_user = find_user_instructions(cfg.data_dir)  # P6：用户级指令（~/.vgent/AGENTS.md）
         found = find_instructions(os.getcwd())  # M10：项目指令（AGENTS.md/CLAUDE.md）
+        # M12-C：项目级记忆（memory_summary 注入 + memory_auto 时自动两阶段管线）
+        memory_store = MemoryFileStore(cfg.data_dir, Path(os.getcwd()))
+        if cfg.memory_auto:
+            memory_pipeline = MemoryPipeline(
+                memory_store,
+                LLMClient(cfg),  # 独立 client（R3：管线不调 ctx.llm）
+                cfg.provider.light_model or cfg.provider.model,
+            )
+        memory_summary = (
+            memory_store.read_summary() if not memory_store.summary_is_placeholder() else None
+        )
         ctx = SessionContext(
             session_id=session_id,
             store=store,
@@ -458,7 +498,11 @@ def main(argv: list[str] | None = None) -> int:
             user_instructions=found_user[1] if found_user else None,  # P6
             ext_commands=ext_commands,  # M10
             data_dir=cfg.data_dir,  # P2：/allow 持久化
+            memory_file_store=memory_store,  # M12-C：/memory 命令
+            memory_pipeline=memory_pipeline,  # M12-C
+            memory_summary=memory_summary,  # M12-C
         )
+        ctx.snapshots = _make_snapshots(ctx)  # M12-B：快照/恢复
         if ext_commands:
             console.print(f"[dim]外部命令：{', '.join(sorted(ext_commands))}[/dim]")
         if found_user:
@@ -473,6 +517,8 @@ def main(argv: list[str] | None = None) -> int:
         repl_prompt = _make_repl_prompter(completions, _toolbar_renderer(ctx, tokens))
         _repl(ctx, console, repl_prompt, last_path, tokens)
     finally:
+        if memory_pipeline is not None:  # M12-C：退出前排空记忆队列（有界重试）
+            memory_pipeline.drain()
         store.close()
     return 0
 
@@ -507,6 +553,7 @@ def _dispatch_command(
         ctx.session_id = ctx.store.create_session()
         _remember_session(last_path, ctx.session_id)
         ctx.engine.compacted = None
+        ctx.snapshots = _make_snapshots(ctx)  # M12-B：切换会话后快照跟随
         tokens["n"] = 0
         console.print(f"[dim]已新建会话 {ctx.session_id[:8]}[/dim]")
         return True
@@ -514,11 +561,13 @@ def _dispatch_command(
         _resume_inline(ctx, console, prompt, last_path, action=text)
         if text == "/resume":  # 切换会话：清掉压缩底稿与累计
             ctx.engine.compacted = None
+            ctx.snapshots = _make_snapshots(ctx)  # M12-B
             tokens["n"] = 0
         return True
     if text.startswith("/resume "):  # /resume last|N|id（对齐 CLI --resume）
         _resume_arg(ctx, console, last_path, text[len("/resume ") :].strip())
         ctx.engine.compacted = None
+        ctx.snapshots = _make_snapshots(ctx)  # M12-B
         tokens["n"] = 0
         return True
     if text in ("/delete", "/delete-session"):
@@ -536,6 +585,9 @@ def _dispatch_command(
     if text == "/memories" or text == "/remember":
         _memories_inline(ctx, console)
         return True
+    if text == "/memory" or text.startswith("/memory "):  # M12-C
+        _memory_inline(ctx, console, text[len("/memory ") :].strip() if text != "/memory" else "")
+        return True
     if text.startswith("/remember "):
         _remember_inline(ctx, console, text[len("/remember ") :].strip())
         return True
@@ -551,6 +603,12 @@ def _dispatch_command(
         return True
     if text == "/allow" or text.startswith("/allow "):
         _allow_inline(ctx, console, text[len("/allow ") :].strip() if text != "/allow" else "")
+        return True
+    if text == "/snapshot" or text.startswith("/snapshot "):  # M12-B
+        _snapshot_inline(ctx, console, text[len("/snapshot ") :].strip() if text != "/snapshot" else "")
+        return True
+    if text == "/restore" or text.startswith("/restore "):  # M12-B
+        _restore_inline(ctx, console, prompt, text[len("/restore ") :].strip() if text != "/restore" else "")
         return True
     # M10：外部命令（~/.vgent/commands/<name>.py 的 run(ctx, args)）；内置优先，这里兜底
     if text.startswith("/") and len(text) > 1:
@@ -621,6 +679,10 @@ def _repl(
                     parts.append(f"计划 {done}/{len(ctx.plan.steps)}")
                 parts.append(f"状态 {ctx.state.value}")
                 console.print("[dim]  " + "；".join(parts) + "[/dim]")
+        except KeyboardInterrupt:
+            # 评审 F3：Ctrl-C 只中断当轮（BaseException 不被 except Exception 捕获，
+            # 原实现会穿透 _repl 退出整个进程）；历史已落库，快照 seal 在 run_turn finally
+            console.print("\n[yellow]已中断本轮（历史已保留）。[/yellow]")
         except Exception as exc:  # noqa: BLE001 — REPL 顶层兜底：任何错误都回到输入，不崩溃
             console.print(f"\n[red]调用失败：{exc}[/red]")
 
@@ -786,7 +848,7 @@ def _recall_inline(ctx: SessionContext, console: Console, keyword: str) -> None:
     for e in hits:
         ctx.store.add_message(
             ctx.session_id,
-            Message("system", f"[记忆] {e.topic}（{e.ts[:10]}）：{e.summary}"),
+            Message("system", memory_note_text(e)),  # M12-C：>1 天附新鲜度警告
         )
     console.print(f"[dim]已注入 {len(hits)} 条记忆（后续对话可见）。[/dim]")
 
@@ -806,6 +868,64 @@ def _memories_inline(ctx: SessionContext, console: Console) -> None:
     for e in entries:
         first = e.summary.splitlines()[0] if e.summary else ""
         console.print(f"  {e.ts[:16]} [{e.topic}] {first[:60]}", markup=False)
+
+
+def _memory_inline(ctx: SessionContext, console: Console, arg: str) -> None:
+    """M12-C：/memory —— 项目级长期记忆（memory_summary / MEMORY.md / rollout）。
+
+    无参=总览+管线状态；show=summary 全文；path=记忆目录；grep <词>=搜索；
+    clear=清空本项目记忆并作废在途写入（不动 episodic.jsonl 条目）。
+    """
+    store = ctx.memory_file_store
+    if store is None:
+        console.print("[yellow]记忆存储未启用（无数据目录）。[/yellow]")
+        return
+    if not arg:
+        summary = store.read_summary()
+        if store.summary_is_placeholder():
+            summary_line = "（尚无浓缩摘要）"
+        else:
+            first = summary.splitlines()[0] if summary else ""
+            summary_line = first[:80]
+        state = (
+            f"管线：运行中（队列 {ctx.memory_pipeline.pending_count}，待合并 "
+            f"{ctx.memory_pipeline.pending_signal_count}）"
+            if ctx.memory_pipeline is not None
+            else "管线：未启用（memory_auto=false）"
+        )
+        console.print(f"[bold]项目长期记忆：[/bold]{summary_line}")
+        console.print(f"[dim]{state}；/memory show 看全文，/memory help 看用法[/dim]")
+        return
+    if arg == "show":
+        console.print(store.read_summary(limit=None), markup=False)
+        return
+    if arg == "path":
+        console.print(str(store.root))
+        return
+    if arg == "help":
+        console.print(
+            "用法：/memory（总览）| /memory show | /memory path | "
+            "/memory grep <词> | /memory clear"
+        )
+        return
+    if arg == "clear":
+        if ctx.memory_pipeline is not None:
+            ctx.memory_pipeline.invalidate()  # 作废在途写入（epoch）
+        store.clear()
+        console.print("[dim]已清空本项目长期记忆（episodic 条目不受影响）。[/dim]")
+        return
+    if arg.startswith("grep "):
+        query = arg[len("grep ") :].strip()
+        if not query:
+            console.print("[yellow]用法：/memory grep <词>（空格分隔 AND）[/yellow]")
+            return
+        out = store.grep(query)
+        if out in ("(no matches)", "(empty query)"):
+            console.print(f"[yellow]{out}[/yellow]")
+            return
+        console.print(out, markup=False)
+        return
+    console.print(f"[red]未知子命令：{arg}（/memory help 查看用法）[/red]")
 
 
 def _mcp_inline(ctx: SessionContext, console: Console) -> None:
@@ -836,7 +956,100 @@ def _compact_inline(ctx: SessionContext, console: Console) -> None:
         console.print("[yellow]没有可压缩的内容（历史已在保护范围内）。[/yellow]")
         return
     ctx.engine.compacted = compacted
+    # M12：压缩结果落库，恢复会话后仍以压缩底稿续聊（不发全量历史）
+    if len(compacted) >= 2 and compacted[1].role == "system" and compacted[1].content:
+        boundary = ctx.store.last_message_id(ctx.session_id)
+        if boundary is not None:
+            ctx.store.upsert_compact(
+                ctx.session_id, compacted[1].content, list(compacted[2:]), boundary
+            )
     console.print(f"[dim]已压缩：{len(msgs)} 条 → {len(compacted)} 条（对后续对话生效）[/dim]")
+
+
+def _snapshot_inline(ctx: SessionContext, console: Console, name: str) -> None:
+    """M12-B：/snapshot [名] —— 把本会话改过的文件拍成命名档。"""
+    if ctx.snapshots is None:
+        console.print("[yellow]快照未启用（无数据目录）。[/yellow]")
+        return
+    try:
+        final = ctx.snapshots.save_named(name or None)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    console.print(f"[dim]已创建命名快照 {final}[/dim]")
+
+
+def _apply_restore(console: Console, report: RestoreReport) -> None:
+    """打印恢复结果（没有可恢复内容时用黄色提示）。"""
+    text = report.format()
+    if text == "没有可恢复的内容":
+        console.print("[yellow]" + text + "[/yellow]")
+    else:
+        console.print("[dim]" + text + "[/dim]")
+
+
+def _restore_inline(
+    ctx: SessionContext,
+    console: Console,
+    prompt: Callable[[str], str],
+    arg: str,
+) -> None:
+    """M12-B：/restore —— 无参列出；last/undo 直接恢复；编号/命名档先预览确认。
+
+    只撤文件，不动对话（claude rewind 语义）。
+    """
+    if ctx.snapshots is None:
+        console.print("[yellow]快照未启用（无数据目录）。[/yellow]")
+        return
+    if not arg:
+        entries = ctx.snapshots.list_entries()
+        if not entries:
+            console.print(
+                "[yellow]没有可恢复的快照（write/edit 改过文件后每回合自动记录）。[/yellow]"
+            )
+            return
+        console.print("[bold]可恢复的快照：[/bold]")
+        for e in entries:
+            files = ", ".join(e["files"][:5]) + (" …" if len(e["files"]) > 5 else "")
+            console.print(
+                f"  {e['key']}: {e['label']}（{e['ts'][:16]}，"
+                f"{len(e['files'])} 个文件：{files}）",
+                markup=False,
+            )
+        console.print("[dim]用法：/restore last | /restore <编号|名> | /restore undo[/dim]")
+        return
+    if arg == "last":
+        _apply_restore(console, ctx.snapshots.restore_last())
+        return
+    if arg == "undo":
+        _apply_restore(console, ctx.snapshots.restore_undo())
+        return
+    # 编号 / 命名档：先展示受影响文件并确认（Web 端无交互，直接执行）
+    entries = ctx.snapshots.list_entries()
+    target = next((e for e in entries if e["key"] == arg), None)
+    if target is None:
+        console.print(f"[red]没有找到快照：{arg}[/red]")
+        return
+    console.print(f"[yellow]将恢复 {len(target['files'])} 个文件（只撤文件，不动对话）：[/yellow]")
+    for f in target["files"]:
+        console.print(f"  {f}", markup=False)
+    try:
+        choice = prompt("确认恢复？（y/n）> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        choice = "n"
+    if choice not in ("y", "yes"):
+        console.print("[dim]已取消。[/dim]")
+        return
+    try:
+        report = (
+            ctx.snapshots.restore_index(int(arg))
+            if arg.isdigit()
+            else ctx.snapshots.restore_named(arg)
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    _apply_restore(console, report)
 
 
 if __name__ == "__main__":

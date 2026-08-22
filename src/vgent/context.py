@@ -73,6 +73,44 @@ _PRUNE_SUMMARY_CAP = 200
 # 低水位剪枝保护的最新消息条数（hermes protect_last_n 思路）
 _PRUNE_PROTECT_LAST_N = 6
 
+# -- M12：tiktoken 惰性封装（离线安全） --------------------------------------
+# 首次调用才 import tiktoken；编码获取/下载失败后本进程内置不可用，回退启发式。
+_tiktoken_unavailable = False
+_tiktoken_cache: dict[str, object] = {}
+
+
+def _tiktoken_count(text: str, model: str | None = None) -> int | None:
+    """tiktoken 计数字数；未安装 / 编码下载失败返回 None（调用方回退启发式）。
+
+    encoding_for_model 对未知模型（如 deepseek-v4-flash）抛 KeyError，
+    自动回退 cl100k_base——估算口径对 OpenAI-compatible 模型已足够。
+    """
+    global _tiktoken_unavailable
+    if _tiktoken_unavailable:
+        return None
+    try:
+        import tiktoken  # 惰性：避免模块级 import 触发联网下载
+    except Exception:  # noqa: BLE001
+        _tiktoken_unavailable = True
+        return None
+    key = model or ""
+    enc = _tiktoken_cache.get(key)
+    if enc is None:
+        try:
+            enc = tiktoken.encoding_for_model(model) if model else tiktoken.get_encoding("cl100k_base")
+        except Exception:  # noqa: BLE001
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+            except Exception:  # noqa: BLE001
+                _tiktoken_unavailable = True
+                return None
+        _tiktoken_cache[key] = enc
+    try:
+        return len(enc.encode(text))
+    except Exception:  # noqa: BLE001
+        _tiktoken_unavailable = True
+        return None
+
 
 @dataclass
 class ContextEngine:
@@ -189,6 +227,58 @@ class ContextEngine:
 
     def _watermark(self, percent: float) -> int:
         return max(1, min(int(self.context_length * percent), self.context_length - 1))
+
+    # -- M12 发送前精确估算（与 usage 校准并存；R6：不动 _tokens/压缩内部） ----
+
+    def reserved_output_tokens(self) -> int:
+        """发送前预留的模型输出 token（claude 有效窗口 - buffer 思路）。
+
+        cfg.reserved_output_tokens > 0 用显式值；否则按窗口 5% 自动
+        （1M→50k；小窗口测试引擎也按比例，避免固定大预留淹没小水位）。
+        """
+        if self.cfg.reserved_output_tokens > 0:
+            return self.cfg.reserved_output_tokens
+        return max(0, int(self.context_length * 0.05))
+
+    def estimate_send_tokens(
+        self,
+        messages: list[Message],
+        model: str | None = None,
+        fixed_extra: str | None = None,
+    ) -> int:
+        """估算发送列表 token（含 system 锚点/思考流/工具参数 + fixed_extra 如 tools schema）。
+
+        tiktoken 精确计数（含 tools schema 这类固定开销，claude/codex 思路）；
+        离线或失败回退启发式——与 _estimate_tokens 同口径 + fixed_extra 按 3 字符/token。
+        """
+        if _tiktoken_unavailable:
+            return self._estimate_tokens(messages) + ((len(fixed_extra) // 3) if fixed_extra else 0)
+        total = 0
+        for m in messages:
+            total += 4  # role 与格式开销（与 _estimate_tokens 同口径）
+            n = _tiktoken_count(m.content or "", model)
+            total += n if n is not None else len(m.content or "") // 3
+            if m.reasoning_content:
+                n = _tiktoken_count(m.reasoning_content, model)
+                total += n if n is not None else len(m.reasoning_content) // 3
+            if m.tool_calls:
+                for tc in m.tool_calls:
+                    n = _tiktoken_count(tc.arguments or "", model)
+                    total += (n if n is not None else len(tc.arguments or "") // 3) + 4
+        if fixed_extra:
+            n = _tiktoken_count(fixed_extra, model)
+            total += n if n is not None else len(fixed_extra) // 3
+        return total
+
+    def should_compress_estimated(
+        self,
+        messages: list[Message],
+        model: str | None = None,
+        fixed_extra: str | None = None,
+    ) -> bool:
+        """发送前触发压缩：估算 + 预留输出 ≥ 高水位（弥补 usage 校准看不到的 system/tools 开销）。"""
+        used = self.estimate_send_tokens(messages, model=model, fixed_extra=fixed_extra)
+        return (used + self.reserved_output_tokens()) >= self._watermark(self.cfg.threshold_percent)
 
     @staticmethod
     def _marker(dropped: int) -> Message:

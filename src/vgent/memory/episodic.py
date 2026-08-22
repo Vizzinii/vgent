@@ -139,6 +139,28 @@ class EpisodicMemory:
         return [e for line in lines if (e := MemoryEntry.from_line(line)) is not None]
 
 
+def memory_note_text(entry: MemoryEntry) -> str:
+    """[记忆] 注入文本（M12：>1 天的条目附新鲜度警告，学 claude memoryAge）。
+
+    agent 自动回忆与 /recall 注入共用，保证格式一致；老条目附
+    「（X 天前记忆，请对照当前代码验证）」防陈年记忆被当事实。
+    """
+    text = f"[记忆] {entry.topic}（{entry.ts[:10]}）：{entry.summary}"
+    days = _entry_age_days(entry.ts)
+    if days is not None and days >= 1:
+        text += f"（{days} 天前记忆，请对照当前代码验证）"
+    return text
+
+
+def _entry_age_days(ts: str) -> int | None:
+    """条目年龄（天）；解析失败返回 None（不附警告，保守不误标）。"""
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+    return max(0, (datetime.now(UTC) - parsed).days)
+
+
 def summarize(msgs: list[Message], llm: Callable, topic: str) -> str:
     """LLM 压缩最近历史为任务摘要；异常/空响应/质量不过关返回 ""（best-effort，不阻断）。
 

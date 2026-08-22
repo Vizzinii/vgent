@@ -300,9 +300,17 @@ def _edit_file_handler(args: dict) -> str:
         replace_all = bool(ra)
     path = Path(raw)
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # 严格解码（评审 F2）：errors="replace" 读 + 写回 = 有损往返，非 UTF-8 文件
+        # （如 GBK）编辑一次原文就永久损坏——拒绝编辑并回喂模型。
+        # read_text 默认 errors="strict" 且带通用换行转换（与写回 write_text 配对）
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         return f"读取失败：{exc}"
+    except UnicodeDecodeError:
+        return (
+            "错误：文件含非 UTF-8 字节，已拒绝编辑（防止有损写回损坏原文）。"
+            "请先用 shell 工具确认文件编码/内容，或让用户处理后重试"
+        )
     count = text.count(old)
     if count == 0:
         return (

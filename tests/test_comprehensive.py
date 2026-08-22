@@ -896,10 +896,11 @@ class TestWeb:
         tools = ToolRegistry()
         mgr = HubManager(
             cfg=SimpleNamespace(
-                provider=SimpleNamespace(name="test", context_length=1000000),
+                provider=SimpleNamespace(name="test", context_length=1000000, model="m", light_model=""),
                 mcp_servers={},
                 permissions=PermissionRules(allow=[], ask=[], deny=[]),
                 data_dir=tmp_path,
+                memory_auto=False,  # M12-C：管线默认不启用
             ),
             store=store,
             llm=FakeLLM(),

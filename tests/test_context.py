@@ -240,3 +240,57 @@ def test_extract_summary_with_fallback_rejects_short() -> None:
 
     assert extract_summary_with_fallback(Message("assistant", "好的，我再试一次。", "嗯")) == ""
     assert extract_summary_with_fallback(Message("assistant", "")) == ""
+
+
+# -- M12：发送前精确估算（tiktoken 惰性 + 启发式兜底） -----------------------------
+
+
+def test_reserved_output_tokens_auto_scales_with_window() -> None:
+    """M12：预留输出默认按窗口 5% 自动（1M→50k，claude 分级 buffer 思路）；显式 >0 覆盖。"""
+    assert ContextEngine(context_length=1_000_000).reserved_output_tokens() == 50_000
+    assert ContextEngine(context_length=2000).reserved_output_tokens() == 100
+    engine = ContextEngine(cfg=ContextConfig(reserved_output_tokens=1234))
+    assert engine.reserved_output_tokens() == 1234
+
+
+def test_estimate_send_tokens_counts_content_and_extra() -> None:
+    """M12：估算含正文 + fixed_extra（tools schema 固定开销）；extra 增加总量。"""
+    engine = ContextEngine()
+    msgs = [Message("user", "hello world")]
+    base = engine.estimate_send_tokens(msgs)
+    assert base > 0
+    with_extra = engine.estimate_send_tokens(msgs, fixed_extra='{"type": "function"}')
+    assert with_extra > base
+
+
+def test_estimate_send_tokens_fallback_matches_heuristic(monkeypatch) -> None:
+    """M12：tiktoken 不可用（离线）→ 回退启发式，与 _estimate_tokens 同口径。"""
+    monkeypatch.setattr("vgent.context._tiktoken_unavailable", True)
+    engine = ContextEngine()
+    msgs = [
+        Message("user", "你好"),
+        Message("assistant", "回复", reasoning_content="思考"),
+        Message("assistant", "", tool_calls=[ToolCall("c1", "shell", '{"a": 1}')]),
+    ]
+    extra = '[{"type": "function"}]'
+    assert engine.estimate_send_tokens(msgs, fixed_extra=extra) == (
+        engine._estimate_tokens(msgs) + len(extra) // 3
+    )
+
+
+def test_should_compress_estimated_flips_with_size() -> None:
+    """M12：发送前估算——消息增长跨过阈值触发（tiktoken 与兜底两条路径都成立）。"""
+    engine = ContextEngine(context_length=2000, cfg=ContextConfig(threshold_percent=0.9))
+    small = [Message("user", "hi")]
+    assert not engine.should_compress_estimated(small)
+    big = [Message("user", "x" * 500) for _ in range(30)]
+    assert engine.should_compress_estimated(big)
+
+
+def test_should_compress_estimated_reserved_shifts_trigger() -> None:
+    """M12：reserved_output_tokens 越大越早触发；0 = 按窗口 5% 自动。"""
+    engine = ContextEngine(context_length=1000, cfg=ContextConfig(threshold_percent=0.9))  # 水位 900
+    msgs = [Message("user", "y" * 200)]  # 启发式 ~70 token，tiktoken ~200
+    assert not engine.should_compress_estimated(msgs)  # 估算 + 5% 预留 < 900
+    engine.cfg.reserved_output_tokens = 50_000
+    assert engine.should_compress_estimated(msgs)  # 估算 + 大预留 ≥ 900

@@ -73,6 +73,14 @@ class SessionStore:
             "session_id TEXT PRIMARY KEY REFERENCES sessions(id),"
             "state TEXT NOT NULL, updated_at TEXT NOT NULL)"
         )
+        # M12：压缩记录（摘要 + 保留尾部 + 边界）——恢复会话后重建发送底稿，
+        # 不发全量历史；messages 表仍是全量真相，本表只是压缩视图的落盘。
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_compacts ("
+            "session_id TEXT PRIMARY KEY REFERENCES sessions(id),"
+            "summary TEXT NOT NULL, retained TEXT NOT NULL,"
+            "boundary_id INTEGER NOT NULL, updated_at TEXT NOT NULL)"
+        )
         self._conn.commit()
 
     @_locked
@@ -106,6 +114,9 @@ class SessionStore:
         self._conn.execute(
             "DELETE FROM session_states WHERE session_id = ?", (session_id,)
         )  # M6 状态表同步清理，避免孤儿残留
+        self._conn.execute(
+            "DELETE FROM session_compacts WHERE session_id = ?", (session_id,)
+        )  # M12 压缩记录同步清理
         self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         self._conn.commit()
 
@@ -200,6 +211,65 @@ class SessionStore:
         ).fetchone()
         return row[0] if row else None
 
+    # -- M12：压缩记录（摘要 + 保留尾部 + 边界）--------------------------------
+
+    @_locked
+    def last_message_id(self, session_id: str) -> int | None:
+        """该会话当前最后一条消息 id（压缩时刻的边界用）。"""
+        row = self._conn.execute(
+            "SELECT MAX(id) FROM messages WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    @_locked
+    def upsert_compact(
+        self, session_id: str, summary: str, retained: list[Message], boundary_id: int
+    ) -> None:
+        """写/覆盖该会话的压缩记录（只保留最新一份）。
+
+        retained：压缩时保留的尾部消息（与 messages 表同源，序列化存 JSON）；
+        boundary_id：压缩时刻的最后消息 id——之后新增的消息用 get_history_after 续接。
+        """
+        self._conn.execute(
+            "INSERT INTO session_compacts "
+            "(session_id, summary, retained, boundary_id, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, "
+            "retained=excluded.retained, boundary_id=excluded.boundary_id, "
+            "updated_at=excluded.updated_at",
+            (
+                session_id,
+                summary,
+                _messages_to_json(retained),
+                boundary_id,
+                _now(),
+            ),
+        )
+        self._conn.commit()
+
+    @_locked
+    def get_compact(self, session_id: str) -> tuple[str, list[Message], int] | None:
+        """读压缩记录 (摘要, 保留尾部, 边界 id)；无则 None。"""
+        row = self._conn.execute(
+            "SELECT summary, retained, boundary_id FROM session_compacts "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0], _messages_from_json(row[1]), int(row[2])
+
+    @_locked
+    def get_history_after(self, session_id: str, message_id: int) -> list[Message]:
+        """id > message_id 的消息（M12：压缩边界之后的新增消息，按序）。"""
+        rows = self._conn.execute(
+            "SELECT role, content, reasoning_content, tool_calls, tool_call_id FROM messages "
+            "WHERE session_id = ? AND id > ? ORDER BY id",
+            (session_id, message_id),
+        ).fetchall()
+        return [
+            Message(r[0], r[1], r[2], _tool_calls_from_json(r[3]), r[4]) for r in rows
+        ]
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -219,3 +289,39 @@ def _tool_calls_from_json(raw: str | None) -> list[ToolCall] | None:
         return None
     data = json.loads(raw)
     return [ToolCall(d["id"], d["name"], d.get("arguments", "")) for d in data]
+
+
+def _messages_to_json(msgs: list[Message]) -> str:
+    """压缩保留的尾部消息 → JSON（供 session_compacts.retained）。"""
+    return json.dumps(
+        [
+            {
+                "role": m.role,
+                "content": m.content,
+                "reasoning_content": m.reasoning_content,
+                "tool_calls": (
+                    [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in m.tool_calls]
+                    if m.tool_calls
+                    else None
+                ),
+                "tool_call_id": m.tool_call_id,
+            }
+            for m in msgs
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _messages_from_json(raw: str | None) -> list[Message]:
+    if not raw:
+        return []
+    data = json.loads(raw)
+    out: list[Message] = []
+    for d in data:
+        tc = (
+            [ToolCall(x["id"], x["name"], x.get("arguments", "")) for x in d["tool_calls"]]
+            if d.get("tool_calls")
+            else None
+        )
+        out.append(Message(d["role"], d["content"], d.get("reasoning_content"), tc, d.get("tool_call_id")))
+    return out

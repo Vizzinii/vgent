@@ -8,3 +8,6 @@ dist/
 
 # 跨端交接文档（私有，不进公开仓库）
 HANDOFF.md
+
+# ZCode 工具工作区产物（plans 等，非本项目文件）
+.zcode/

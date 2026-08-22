@@ -4,17 +4,18 @@
 
 A general-purpose agent CLI (runtime harness) built from scratch by borrowing the best ideas from mature implementations — hermes-agent, openai-agents-python, OpenManus, MetaGPT, ag2, openclaw, gemini-cli and more. It is designed for daily local work: files, shell, and search, powered by an OpenAI-compatible model (DeepSeek by default, 1M context, multi-provider configurable).
 
-**Status**: core features complete and daily-usable — REPL + local Web UI, five built-in tools, 3-tier permissions with persistent rules, 1M-token context management, task planning + agent state machine, failure reflection, cross-session memory (project-scoped), MCP client, headless one-shot execution.
+**Status**: core features complete and daily-usable — REPL + local Web UI, five built-in tools, 3-tier permissions with persistent rules, 1M-token context management, task planning + agent state machine, failure reflection, cross-session memory (project-scoped), snapshot/restore, MCP client, headless one-shot execution.
 
 ## Features
 
 - **Dual interface**: interactive REPL (prompt_toolkit + rich) **and** a local Web UI (`vgent --serve`, stdlib only, zero extra dependencies) sharing the same session storage.
 - **Native tool calling**: JSON Schema tool definitions; built-in `shell` / `read_file` / `write_file` / `edit_file` / `search`.
 - **3-tier permissions + rules**: read auto-approves, write/exec requires confirmation, unknown tiers are denied; confirm with `y` once / `a` always (per-session sticky) / `n` reject. `[permissions]` rules in `config.toml` persist across sessions (`allow` always, `ask` always confirm, `deny` rejects **and prunes the tool from what the model can see**); `/allow` writes approvals back to the config.
-- **Context management**: within the 1M window, low-watermark free pruning (tool-result summaries, orphan tool-pair cleanup) + high-watermark compaction (TailWindow zero-cost / Summarize structured LLM summary, `tail` or `summarize` strategy, `/compact` manual trigger). SQLite keeps full history; compaction only affects the send list.
+- **Context management**: within the 1M window, low-watermark free pruning (tool-result summaries, orphan tool-pair cleanup) + high-watermark compaction (TailWindow zero-cost / Summarize structured LLM summary, `tail` or `summarize` strategy, `/compact` manual trigger); pre-send tiktoken estimation (includes tools-schema overhead + reserved output tokens, falls back to a heuristic when offline); compaction results are persisted, so a resumed session keeps chatting from the compacted base (no full-history resend). SQLite keeps full history.
 - **Task planning + state machine**: multi-step tasks get an auto-generated plan block, step statuses update and persist as execution proceeds (`/plan` to view, `/plan new` to redo).
 - **Failure reflection loop**: after a tool failure the LLM produces an explicit reflection (Failure/Action) injected into the next round (`/reflect` manual trigger, persisted).
-- **Cross-session memory**: task summaries stored as JSONL on this machine (`/remember` / `/recall` / `/memories`), auto-recall injection **scoped to the current project** (no cross-project leakage).
+- **Cross-session memory**: task summaries stored as JSONL on this machine (`/remember` / `/recall` / `/memories`), auto-recall injection **scoped to the current project** (no cross-project leakage); with `memory_auto=true`, an **automatic two-stage memory pipeline** runs — per-turn background extraction (secret blacklist filtered) + debounced consolidation (≥3 signals or 5 min idle) into `MEMORY.md` (registry) / `memory_summary.md` (short overview injected into the system prompt); manage via `/memory` and query on demand with the `memory_read` / `memory_grep` tools.
+- **Snapshot / restore**: `write_file`/`edit_file` register the pre-write content automatically (sha256 dedup); each turn is sealed into a versioned snapshot (multiple versions of the same file across turns); `/snapshot [name]` saves a named snapshot, `/restore last|N|name|undo` restores files only (conversation untouched); a crashed, unsealed turn is promoted to a snapshot on the next start (claude fileHistory-inspired).
 - **MCP client**: stdio connection to local MCP servers; tools appear with a `<server>_<tool>` prefix (`/mcp` to list).
 - **Session persistence**: SQLite two-table + WAL; sessions can be listed / resumed / deleted; last session is remembered.
 - **Project instructions**: user-level (`~/.vgent/AGENTS.md`) and project-level (`AGENTS.md`/`CLAUDE.md` found upward from the working directory) instructions are injected into the first LLM call; **user instructions come first**; user-defined slash commands via `~/.vgent/commands/<name>.py`.
@@ -89,9 +90,12 @@ REPL commands:
 | `/remember <topic>` | Remember the current session (LLM summary stored locally) |
 | `/recall <keyword>` | Search memory and inject it into context |
 | `/memories` | List remembered task summaries |
+| `/memory [sub]` | Project long-term memory: no arg = overview + pipeline status; `show` / `path` / `grep <kw>` / `clear` |
 | `/mcp` | List loaded MCP tools |
 | `/reasoning` | Toggle streaming display of model thinking (on/off) |
 | `/allow <tool>` | Approve a tool (per-session sticky + persisted to config.toml) |
+| `/snapshot [name]` | Save a named snapshot of the files this session has touched (default: timestamp) |
+| `/restore` | List restorable snapshots (`/restore last\|N\|name\|undo`; files only, conversation untouched) |
 | `/help` `/exit` | Help / quit |
 
 ## Tools & permissions
@@ -103,6 +107,8 @@ REPL commands:
 | `edit_file` | write | Surgical edit: exact string match replace (unique match, replace_all, ambiguity/not-found errors fed back; requires confirmation) |
 | `read_file` | read | Read a file (UTF-8, with line numbers; auto-approved) |
 | `search` | read | Recursive regex search (skips .git/node_modules etc.; auto-approved) |
+| `memory_read` | read | Read a project long-term memory file (MEMORY.md / rollout_summaries/...; refuses to re-read memory_summary.md; auto-approved) |
+| `memory_grep` | read | Keyword search across project memory (space-separated AND; auto-approved) |
 
 Confirmation flow: `y` run once / `a` always for this session (sticky) / `n` reject (the rejection is fed back to the model, which adjusts). Environments without an interactive confirm (pipes/headless) default to reject — a safe default.
 
@@ -121,15 +127,17 @@ base_url = "https://api.deepseek.com"
 model = "deepseek-v4-flash"    # DeepSeek V4 Flash, 1M context
 api_key = ""                   # put the key here
 api_key_env = "DEEPSEEK_API_KEY"  # or point at an env var (takes precedence over api_key; empty = file key only)
+light_model = ""               # light model for background tasks (e.g. memory extraction); empty = use model
 
 [context]                      # context engine
 threshold_percent = 0.75       # high watermark: trigger compaction
 prune_percent = 0.30           # low watermark: trigger free pruning
 tail_token_budget = 20000      # tail token budget preserved during compaction
 compact_strategy = "tail"      # tail (zero-cost) | summarize (LLM summary, needs /compact)
+reserved_output_tokens = 0     # reserved output tokens before sending; 0 = auto (5% of window, 50k for 1M)
 
 show_reasoning = false         # whether to stream model thinking by default (/reasoning toggles)
-memory_auto = false            # auto-save a session summary when the task plan completes
+memory_auto = false            # enable the automatic two-stage memory pipeline (off by default)
 
 [mcp.servers.echo]             # MCP server (stdio; tools registered with server_tool prefix)
 command = "python"             # launch command
@@ -148,7 +156,7 @@ Others: `log_level`, `data_dir` (default `~/.vgent` on this machine; override wi
 
 - **Task planning**: multi-step tasks generate a plan on the first turn (`/plan` view, `/plan new` redo); step statuses update and persist with the session.
 - **Context compaction**: `/compact` compresses the middle history into a structured summary (`<analysis>` draft + `<summary>` with required sections: unfinished tasks / key decisions / key facts / safety constraints preserved verbatim; falls back to thinking content when the body is a fragment, and to a TailWindow marker when too short). Auto-triggered at the high watermark (default 75%, configurable via `compact_strategy`).
-- **Memory**: `/remember <topic>` stores, `/recall <keyword>` retrieves and injects, `/memories` lists; topic matches auto-inject a recall (not persisted), **scoped to the current project**; `memory_auto=true` saves a summary when the plan completes.
+- **Memory**: `/remember <topic>` stores, `/recall <keyword>` retrieves and injects, `/memories` lists; topic matches auto-inject a recall (not persisted; entries older than 1 day get a "verify against current code" freshness warning), **scoped to the current project**; `memory_auto=true` enables the **automatic two-stage memory pipeline** (per-turn extraction → debounced consolidation of MEMORY.md + memory_summary.md, secret blacklist, drained on exit); `/memory` subcommands view/search/clear; the `memory_read` / `memory_grep` tools let the model query on demand.
 - **Reflection**: after a tool failure, one explicit reflection (Failure/Action) is injected to guide correction; `/reflect` triggers manually (persisted).
 - **AGENTS.md instructions**: user-level (`~/.vgent/AGENTS.md`) and project-level (nearest `AGENTS.md`/`CLAUDE.md` found upward from the working directory, 8 levels / 8K cap) instructions are injected into the first LLM call — **user first, project second**; write your conventions into the file and they apply.
 - **External commands**: `~/.vgent/commands/<name>.py` with `run(ctx, args: str) -> str` is callable as `/name args` in the REPL; built-ins take priority, broken files are skipped without blocking startup.
@@ -156,8 +164,9 @@ Others: `log_level`, `data_dir` (default `~/.vgent` on this machine; override wi
 ## Known limitations
 
 - **Tool surface**: only `shell` / `read_file` / `write_file` / `edit_file` / `search`; no web fetch or browser control. MCP is a stdio-only client that rebuilds the connection per call (no persistent connection); streamable HTTP/SSE transport not implemented.
-- **Context & memory**: memory retrieval is keyword substring matching (no tokenization or vector search); auto-summary is off by default (`memory_auto=false`); `/exit` does not auto-save (only explicit `/remember` or plan completion does).
+- **Context & memory**: memory retrieval is keyword substring matching (no tokenization or vector search); the automatic memory pipeline is off by default (`memory_auto=false`; manual `/remember` still works); `/exit` does not auto-save (only explicit `/remember` or pipeline extraction does).
 - **Planning & reflection**: plan generation depends on model cooperation (best-effort; no plan if the model refuses); failure detection is a conservative heuristic that may miss or misfire.
+- **Snapshot / restore**: only tracks files inside the working directory (relative to the launch dir) changed via `write_file`/`edit_file`; bash file edits are not snapshotted; 20 turn snapshots + 20 named snapshots per session (oldest evicted), reference-counted blob GC, stale snapshot dirs (inactive 30+ days) cleaned at startup; `/restore` executes directly in the Web UI without a confirmation dialog (the CLI confirms).
 - **Web UI**: single-user localhost without auth; per-session serial execution (input disabled while running); external commands are REPL-only; native styles replace rich rendering in the browser.
 - **Platform**: under Git Bash/mintty or piped input, prompt_toolkit cannot access the Windows console, so the REPL falls back to plain `input()` (no multiline/history/completion; functionality unaffected). The Web UI is not affected.
 - **Concurrency**: v1 is fully sync with serial per-session execution; no parallel tool calls yet. Async refactoring is deferred until there is a real need.
@@ -178,12 +187,12 @@ Eight components along the message flow (details in the code):
 | ⑦ | Permissions | `permission.py` | 3 tiers + sticky confirm + rules table |
 | ⑧ | Config | `config.py` | Loads `~/.vgent/config.toml` (providers / permission rules / MCP) |
 
-v2 modules: `task.py` (task planning), `state.py` (state machine), `reflection.py` (reflection loop), `memory/episodic.py` (cross-session memory, project-scoped), `mcp/` (MCP client), `workspace.py` (AGENTS.md instructions), `commands.py` (external commands).
+v2 modules: `task.py` (task planning), `state.py` (state machine), `reflection.py` (reflection loop), `memory/` (cross-session memory: `episodic.py` entries + `store.py`/`prompts.py`/`pipeline.py`/`tools.py` automatic two-stage pipeline), `snapshot.py` (snapshot/restore), `mcp/` (MCP client), `workspace.py` (AGENTS.md instructions), `commands.py` (external commands).
 
 ## Development
 
 ```bash
-uv run pytest           # tests (311)
+uv run pytest           # tests (369)
 uv run ruff check .     # lint
 ```
 
